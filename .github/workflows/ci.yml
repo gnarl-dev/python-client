@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: lint + types + unit
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling. A client is embedded in whatever the
+        # caller already runs, so the oldest supported release has to stay
+        # green — it is the one nobody tests locally.
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e '.[dev]'
+      - name: ruff
+        run: ruff check .
+      - name: mypy
+        run: mypy
+      - name: unit, integration and regression
+        # Conformance skips here: no node. It has its own job.
+        run: pytest -v
+
+  conformance:
+    # The layer that matters. Importing proves the types match the
+    # description; only this proves the description matches the server.
+    name: conformance against a real node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+
+      - name: Fetch a node
+        run: |
+          set -euo pipefail
+          tag=$(curl -fsSL https://api.github.com/repos/lucenia/lucenia/releases/latest \
+                | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+          echo "using $tag"
+          curl -fsSL -o node.tar.gz \
+            "https://github.com/lucenia/lucenia/releases/download/$tag/lucenia-x86_64-unknown-linux-gnu.tar.gz"
+          tar xzf node.tar.gz
+          # A node runs JVM-free on the native engine, so no Java is needed.
+          echo "LUCENIA_BIN=$PWD/lucenia" >> "$GITHUB_ENV"
+
+      - name: Conformance and doc tests
+        # Named explicitly rather than run as a bare `pytest`: if the harness
+        # ever fails to find the node it SKIPS, and a green run that skipped
+        # everything is worse than a red one. The step after this asserts it
+        # actually ran.
+        run: pytest tests/conformance -v --junitxml=conformance.xml
+
+      - name: The conformance suite actually ran
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          suite = ET.parse("conformance.xml").getroot().find("testsuite")
+          ran = int(suite.get("tests")) - int(suite.get("skipped"))
+          print(f"{ran} conformance tests executed")
+          if ran < 30:
+              sys.exit(
+                  f"only {ran} conformance tests executed — the harness found "
+                  "no node and skipped, which passes without proving anything"
+              )
+          PY
+
+  spec-drift:
+    # The generated layer must match the description it claims to come from.
+    # A hand-edit here is how a client silently stops matching the server.
+    name: generated layer is in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install 'datamodel-code-generator>=0.82'
+      - name: Regenerate and diff
+        run: |
+          set -euo pipefail
+          datamodel-codegen \
+            --input src/gnarl/openapi.yaml --input-file-type openapi \
+            --output src/gnarl/_models.py --output-model-type pydantic_v2.BaseModel \
+            --target-python-version 3.10 --use-standard-collections \
+            --use-union-operator --field-constraints --use-schema-description \
+            --collapse-root-models --deserialize-default-values enum \
+            --use-default-kwarg
+          # The timestamp line changes on every run and means nothing.
+          if ! git diff --exit-code --ignore-matching-lines='^#   timestamp:' \
+               -- src/gnarl/_models.py; then
+            echo
+            echo "src/gnarl/_models.py does not match src/gnarl/openapi.yaml."
+            echo "It is generated — edit the spec and regenerate; see the"
+            echo "command in README.md."
+            exit 1
+          fi

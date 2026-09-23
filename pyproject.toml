@@ -30,7 +30,9 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://gnarl.dev"
-Source = "https://github.com/lucenia/gnarl-python"
+Source = "https://github.com/gnarl-dev/python-client"
+Issues = "https://github.com/gnarl-dev/python-client/issues"
+Documentation = "https://gnarl.dev/docs"
 
 [project.optional-dependencies]
 dev = [

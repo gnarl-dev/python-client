@@ -1,4 +1,4 @@
-# gnarl-python
+# python-client
 
 The Python client for [Gnarl](https://gnarl.dev) — a decentralized search fabric.
 
@@ -217,12 +217,8 @@ from gnarl import Client
 c = Client("https://node.example.com", token=os.environ["GNARL_TOKEN"])
 ```
 
-An address without a scheme becomes **https**, so `Client("node.example.com")`
-is not silently downgraded to plaintext.
-
-A node generates a self-signed certificate on first run. Against a node you
-started yourself, `verify=False` skips certificate verification — never against
-one you did not.
+See [Connecting](#connecting) for what the node's certificate means for the
+`verify` argument.
 
 ## How this package is built
 

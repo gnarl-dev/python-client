@@ -29,7 +29,7 @@ README = Path(__file__).resolve().parents[2] / "README.md"
 #: The placeholder address every runnable example uses. It is rewritten to the
 #: live node's address before the block is executed, so the README can show a
 #: realistic URL and the test can still run.
-PLACEHOLDER = "http://localhost:8080"
+PLACEHOLDER = "https://localhost:8080"
 
 FENCE = re.compile(
     r"(?:(?P<directive><!--\s*doctest:\s*(?P<action>\w+)(?P<rest>[^>]*?)-->)\s*\n)?"

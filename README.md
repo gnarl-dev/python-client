@@ -14,7 +14,7 @@ pip install gnarl
 ```python
 from gnarl import Client, query as q
 
-with Client("http://localhost:8080") as c:
+with Client("https://localhost:8080", verify=False) as c:
     c.create_index("places", q.schema({
         "name":     q.keyword_field(),
         "location": q.geo_point_field(),
@@ -37,12 +37,36 @@ import asyncio
 from gnarl import AsyncClient, query as q
 
 async def main():
-    async with AsyncClient("http://localhost:8080") as c:
+    async with AsyncClient("https://localhost:8080", verify=False) as c:
         res = await c.search("places", q.match_all())
         print(len(res))
 
 asyncio.run(main())
 ```
+
+## Connecting
+
+**A node serves TLS by default.** `lucenia start` listens on **8080** over
+**https**, using a self-signed certificate it generates on first run. `--no-tls`
+turns that off, and the desktop build uses it, but a node you started with the
+plain command speaks https — which is why every example above says so.
+
+That certificate cannot be verified, because nothing signed it. `verify=False`
+is the right answer for a node **you started yourself** and the wrong answer
+for anything else: it turns off the protection TLS exists to provide, and a
+client that keeps it on by habit will happily talk to whoever answers the
+address. Against a node with a real certificate, pass nothing:
+
+<!-- doctest: skip because it needs a deployment with a real certificate -->
+```python
+from gnarl import Client
+
+c = Client("https://search.example.com")          # verified, the normal case
+c = Client("https://search.example.com", verify="/etc/ssl/internal-ca.pem")
+```
+
+An address with no scheme becomes **https**, so `Client("search.example.com")`
+is never silently downgraded to plaintext.
 
 ## Errors
 
@@ -51,7 +75,7 @@ Every failure is a `GnarlError`. Catch the subclass you care about:
 ```python
 from gnarl import Client, AlreadyExists, ValidationError, query as q
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 try:
     c.create_index("places", q.schema({"name": q.keyword_field()}))
 except AlreadyExists:
@@ -67,7 +91,7 @@ Each one carries `type`, `reason`, `status`, an optional `detail`, and
 import time
 from gnarl import Client, RateLimited, query as q
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 try:
     c.search("places", q.match_all())
 except RateLimited as e:
@@ -88,7 +112,7 @@ answer is a wrong answer:
 ```python
 from gnarl import Client, IncompleteResult, query as q
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 try:
     res = c.search("places", q.match_all(), require_complete=True)
     print(f"complete: {len(res)} hits from {res.coverage.served_claims} claims")
@@ -109,7 +133,7 @@ the node holds independently of whoever served it:
 ```python
 from gnarl import Client, query as q
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 res = c.search("places", q.match_all(), verify=True)
 if not res.partial:
     print("every row returned was proven")
@@ -132,7 +156,7 @@ came to:
 ```python
 from gnarl import Client, query as q
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 res = c.search("places", q.match_all(), profile=True)
 fan_out = res.profile.fan_out
 print(f"{fan_out.nodes_responded}/{fan_out.nodes_contacted} nodes answered")
@@ -172,7 +196,7 @@ common way to lose writes silently. `failed_items` makes the check a one-liner:
 ```python
 from gnarl import Client, failed_items
 
-c = Client("http://localhost:8080")
+c = Client("https://localhost:8080", verify=False)
 result = c.bulk("places", [
     {"name": "sydney"},
     {"name": "melbourne"},
@@ -245,7 +269,7 @@ client bugs live. So the conformance suite starts a real node and drives it:
 ```bash
 pytest                                            # everything but conformance
 LUCENIA_BIN=/path/to/lucenia pytest               # starts a node, runs it all
-GNARL_TEST_NODE=http://localhost:8080 pytest      # uses a node you have
+GNARL_TEST_NODE=https://localhost:8080 pytest     # uses a node you have
 ```
 
 The README's examples are executed by `tests/test_readme_examples.py` against a

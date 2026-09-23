@@ -10,7 +10,7 @@ Running it::
 
     pytest                                        # conformance skips
     LUCENIA_BIN=/path/to/lucenia pytest           # starts a node, runs it all
-    GNARL_TEST_NODE=http://localhost:8080 pytest  # uses a node you have
+    GNARL_TEST_NODE=https://localhost:8080 pytest # uses a node you have
 
 The harness finds a node in this order, and says exactly what to do if it
 cannot:
@@ -20,6 +20,13 @@ cannot:
 3. a ``lucenia`` binary in the sibling lucenia checkout's target directory.
 
 A node runs without a JVM on the native engine, so no Java toolchain is needed.
+
+The node it starts runs with TLS, which is the PRODUCT DEFAULT — `lucenia start`
+serves https on 8080 from a self-signed certificate and `--no-tls` is the opt
+out. The harness used to pass `--no-tls` to keep itself free of certificate
+handling, and that quietly made the suite test a configuration most readers will
+never run: it is also what let both client READMEs ship an `http://` quick start
+that cannot connect to a default node.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 
 from gnarl import Client, GnarlError
@@ -70,7 +78,7 @@ def _wait_ready(addr: str, within: float) -> str | None:
     """
     deadline = time.monotonic() + within
     last = "never tried"
-    with Client(addr, timeout=2.0) as probe:
+    with Client(addr, timeout=2.0, verify=_verify_for(addr)) as probe:
         while time.monotonic() < deadline:
             try:
                 probe.ping()
@@ -116,8 +124,6 @@ def node() -> Iterator[str]:
             # discover a developer's cluster, join it, and then assert on data
             # it does not own.
             "--single-node",
-            # No certificate handling in the harness.
-            "--no-tls",
             # `lucenia start` enables the production rate limiter: 600
             # requests/minute per client IP with a burst of 60. That is an
             # abuse brake for an open mesh, and a conformance suite is not
@@ -131,7 +137,9 @@ def node() -> Iterator[str]:
         stdout=log,
         stderr=subprocess.STDOUT,
     )
-    addr = f"http://127.0.0.1:{port}"
+    # https, not http: TLS is on unless `--no-tls` is passed, and a harness
+    # that opts out is not testing what a reader runs.
+    addr = f"https://127.0.0.1:{port}"
     try:
         problem = _wait_ready(addr, BOOT_TIMEOUT)
         if problem:
@@ -152,9 +160,22 @@ def node() -> Iterator[str]:
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def _verify_for(addr: str) -> bool:
+    """Whether to verify the node's certificate.
+
+    A node generates a SELF-SIGNED certificate on first run, so verification
+    cannot succeed against one this harness started — and `verify=False` is
+    exactly right there and exactly wrong anywhere else. Narrowed to loopback so
+    that pointing `$GNARL_TEST_NODE` at a real deployment still verifies its
+    certificate rather than silently accepting anyone's.
+    """
+    host = httpx.URL(addr).host
+    return host not in ("127.0.0.1", "::1", "localhost")
+
+
 @pytest.fixture
 def client(node: str) -> Iterator[Client]:
-    with Client(node, timeout=60.0) as c:
+    with Client(node, timeout=60.0, verify=_verify_for(node)) as c:
         yield c
 
 

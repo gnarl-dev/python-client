@@ -22,7 +22,7 @@ from gnarl import (
 )
 from gnarl import query as q
 
-from .conftest import until
+from .conftest import _verify_for, until
 
 pytestmark = pytest.mark.conformance
 
@@ -473,7 +473,7 @@ async def test_the_async_client_works_against_a_real_node(node: str, client, ind
     client.index_document(name, {"headline": "async too"}, id="a1")
     searchable(client, name, q.match_all(), 1)
 
-    async with AsyncClient(node, timeout=60.0) as ac:
+    async with AsyncClient(node, timeout=60.0, verify=_verify_for(node)) as ac:
         res = await ac.search(name, q.match_all())
         assert [h.field_id for h in res.hits] == ["a1"]
         assert (await ac.count(name)) == 1

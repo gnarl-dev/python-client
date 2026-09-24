@@ -285,9 +285,27 @@ paths:
       operationId: deleteDocument
       tags: [documents]
       summary: Delete a document by ID
+      description: |
+        Remove one document.
+
+        **A delete is acknowledged when it is DURABLE, not when it has become
+        invisible.** The same asymmetry as a write, and easy to miss in this
+        direction: a `GET` or a `_search` issued immediately after this returns
+        200 can still see the document, until the next commit lands.
+
+        `_doc` and `_search` cross that boundary TOGETHER — there is no window
+        where one shows the document and the other does not — so a reader is
+        never caught between two answers.
+
+        Do not read a still-readable document as a failed delete, and do not
+        assert absence without waiting for it. If "gone" has to be observable,
+        poll until the read reports `document_not_found`. The wait is short,
+        but it is not zero, and it is not a fixed number worth hard-coding.
       responses:
         "200":
-          description: Document deleted
+          description: |
+            Delete accepted and durable. The document may remain readable for
+            a short interval — see the description above.
         "404":
           description: Document or index not found
           content:
@@ -573,6 +591,13 @@ paths:
       operationId: deleteNamespaceDocument
       tags: [namespaces]
       summary: Delete a document from a namespace
+      description: |
+        Remove one document from a namespace.
+
+        As with `deleteDocument`, this is acknowledged when it is DURABLE, not
+        when it has become invisible: a read issued immediately afterwards can
+        still see the document until the next commit lands. Poll for
+        `document_not_found` rather than asserting absence straight away.
       responses:
         "200":
           description: Delete result

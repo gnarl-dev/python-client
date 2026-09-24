@@ -169,3 +169,38 @@ jobs:
             echo "command in README.md."
             exit 1
           fi
+
+  spec-freshness:
+    # The OTHER half of spec-drift, and the half that was missing.
+    #
+    # `spec-drift` regenerates the models and diffs them against the VENDORED
+    # description — so it proves this client is internally consistent and says
+    # nothing about whether the vendored copy matches the server's. A client
+    # can be perfectly self-consistent and perfectly stale, and this one was:
+    # it shipped a description that predated the `SearchProfile` fix the client
+    # itself uncovered.
+    #
+    # Gated on the same token as conformance, because `lucenia/lucenia` is
+    # internal.
+    name: vendored description is current
+    runs-on: ubuntu-latest
+    needs: can-reach-a-node
+    if: needs.can-reach-a-node.outputs.available == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diff against the server's description
+        env:
+          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api repos/lucenia/lucenia/contents/rust/api/openapi.yaml \
+            --jq '.content' | base64 -d > /tmp/upstream.yaml
+          if ! diff -u /tmp/upstream.yaml src/gnarl/openapi.yaml; then
+            echo
+            echo "::error::src/gnarl/openapi.yaml is not the server's current"
+            echo "description. Re-vendor it and regenerate the models — see the"
+            echo "command in README.md. A stale contract is how a generated"
+            echo "client goes on describing an API the server no longer has."
+            exit 1
+          fi
+          echo "vendored description matches lucenia/lucenia main"

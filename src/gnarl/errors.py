@@ -28,6 +28,7 @@ __all__ = [
     "InternalError",
     "Unavailable",
     "IncompleteResult",
+    "JobFailed",
 ]
 
 
@@ -133,6 +134,23 @@ class IncompleteResult(GnarlError):
                 f"{cov.served_claims} of {cov.expected_claims} claims answered, "
                 f"{len(cov.skipped_claims)} skipped (require_complete was set)"
             ),
+        )
+
+
+class JobFailed(GnarlError):
+    """A snapshot, restore or cleanup job finished in ``failed``.
+
+    Raised by the job poller. ``job`` is the final job record, whose ``error``
+    says why; a job that was RUNNING when its node stopped is reported as
+    failed too, because whether it finished is unknown.
+    """
+
+    def __init__(self, job: Any) -> None:
+        self.job = job
+        kind = job.kind.value if job.kind is not None else "job"
+        super().__init__(
+            type="job_failed",
+            reason=f"{kind} {job.id} failed: {job.error or 'no reason given'}",
         )
 
 

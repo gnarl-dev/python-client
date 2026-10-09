@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from . import query
 from ._models import (
+    BackupSchedule,
     BulkIndexResponse,
     BulkItemResult,
     ClaimRoute,
@@ -47,20 +48,30 @@ from ._models import (
     FieldType,
     Hit,
     IndexMetadata,
+    IndexPlacement,
+    IndexPolicy,
     IndexSchema,
+    Namespace,
+    NamespaceKeyStatus,
     Query,
     QueryScope,
     SearchCoverage,
     SearchProfile,
     SkippedClaim,
+    SnapshotDescriptor,
+    SnapshotJob,
     TotalHits,
     Verification,
 )
+from ._models import V1IndexesNameForcemergePostResponse as ForceMergeResult
+from ._models import V1MemoryRecallPostResponse as RecallResult
+from ._models import V1MemoryRememberPostResponse as RememberResult
 from .client import (
     DEFAULT_TIMEOUT,
     AsyncClient,
     BulkDoc,
     Client,
+    Entitlement,
     NodeStatus,
     NodeVersion,
     SearchResult,
@@ -73,6 +84,7 @@ from .errors import (
     GnarlError,
     IncompleteResult,
     InternalError,
+    JobFailed,
     NotFound,
     RateLimited,
     Unauthenticated,
@@ -80,6 +92,9 @@ from .errors import (
     Unsupported,
     ValidationError,
 )
+from .memory import AsyncMemory, Memory
+from .namespaces import AsyncNamespaces, NamespaceList, Namespaces
+from .snapshots import AsyncSnapshots, Snapshots
 
 __version__ = "0.2.0"
 
@@ -91,6 +106,14 @@ __all__ = [
     "BulkDoc",
     "NodeStatus",
     "NodeVersion",
+    "Entitlement",
+    "NamespaceList",
+    "Namespaces",
+    "AsyncNamespaces",
+    "Memory",
+    "AsyncMemory",
+    "Snapshots",
+    "AsyncSnapshots",
     "DEFAULT_TIMEOUT",
     "failed_items",
     # queries and schemas
@@ -112,6 +135,16 @@ __all__ = [
     "IndexMetadata",
     "BulkIndexResponse",
     "BulkItemResult",
+    "IndexPolicy",
+    "IndexPlacement",
+    "ForceMergeResult",
+    "Namespace",
+    "NamespaceKeyStatus",
+    "RememberResult",
+    "RecallResult",
+    "SnapshotJob",
+    "SnapshotDescriptor",
+    "BackupSchedule",
     # errors
     "GnarlError",
     "NotFound",
@@ -125,5 +158,6 @@ __all__ = [
     "InternalError",
     "Unavailable",
     "IncompleteResult",
+    "JobFailed",
     "__version__",
 ]

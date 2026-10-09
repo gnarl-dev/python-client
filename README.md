@@ -220,6 +220,99 @@ for item in failed_items(result):
     print("failed:", item.field_id, item.error.reason)
 ```
 
+## Namespaces
+
+Many lightweight tenants over shared pools. A namespace exists from its first
+write, and every read is fenced to it by a filter the node applies and the
+caller cannot override:
+
+```python
+from gnarl import Client, query as q
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.namespaces.index_document(
+        "tenant-a", {"subject": "invoice overdue"}, id="t1", wait_for="visible"
+    )
+    res = c.namespaces.search("tenant-a", q.match("subject", "invoice"))
+    print([h.field_id for h in res])
+```
+
+`wait_for="visible"` returns once the write is searchable, so the search right
+after it sees it. Without it a write is acknowledged when it is DURABLE, which
+comes first.
+
+`c.namespaces` also has `bulk`, `get_document`, `delete_document`, `list`,
+`put_mapping` (declare a `dense_vector` field, which gives the namespace a
+dedicated index), `promote`, and the bring-your-own-key trio `set_key`,
+`key_status` and `revoke_key`. `list()` follows every page and reports
+`partial` when a peer did not answer: the catalog is not replicated, so an
+unreachable peer means a namespace may be missing.
+
+## Agent memory
+
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.memory.remember("the boat is moored at pier 4", namespace="deckhand")
+    found = c.memory.recall("where is the boat", namespace="deckhand", k=3)
+    for mem in found.memories:
+        print(f"{mem.score:.2f}  {mem.content}")
+```
+
+Embedding happens on the node. `answer()` composes over what `recall` finds,
+and `ingest_document`, `ingest_messages` and `ingest_voice` take files, chat
+transcripts and voice notes. `ingest_document` requires `space`: `personal`
+stays on the device and `household` is replicated to the mesh's peers, so there
+is deliberately no default.
+
+## Subscription
+
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    ent = c.entitlement()
+    print(ent.state)            # active, refused, unenforced or none
+    if ent.expires_at:
+        print("renews by", ent.expires_at.date())
+```
+
+`refused` is not `none`: a key is present and was rejected — expired, or signed
+by a key this build does not trust — and the person holding it has paid.
+`not_after` on the wire is epoch **seconds**; `expires_at` reads it as such.
+Activate a key from the account page with `c.activate_entitlement(key)`; a
+refusal raises `ValidationError` whose `reason` says which failure it was.
+
+## Backup and restore
+
+<!-- doctest: skip because it writes a repository to a directory on the node's host -->
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.snapshots.register_repository("local", {"type": "fs", "location": "/var/backups/gnarl"})
+    job = c.snapshots.create("local", "places-1", index="places")
+    done = c.snapshots.wait(job)              # raises JobFailed if it failed
+    print(done.result)
+
+    c.snapshots.set_schedule("local", "places", every_hours=24)
+```
+
+Snapshot, restore and cleanup run in the background, one at a time per node;
+each returns a job and `wait()` polls it to the end. A second job while one is
+running raises `Conflict`. A restore refuses a snapshot this node cannot
+attribute to itself or a known peer until you pass the signer's key or consent
+with `allow_unverified_signer=True`, and refuses to roll a live index back
+without `allow_overwrite_live_index=True`.
+
+## Index maintenance
+
+`c.forcemerge(index)` merges segments (expensive; for a quiet period), and
+`c.get_policy(index)` / `c.put_policy(index, placement="local")` read and narrow
+how far an index's data may travel. Only the node that created an index may
+change its policy; any other answers `Forbidden`.
+
 ## Authentication
 
 A node with RBAC enabled exempts loopback callers, so a local node usually

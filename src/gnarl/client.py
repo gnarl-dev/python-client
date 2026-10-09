@@ -15,16 +15,42 @@ There is an :class:`AsyncClient` with the same surface.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
-from dataclasses import field as _dc_field
-from typing import Any
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import httpx
 
 from . import _models as m
-from .errors import GnarlError, IncompleteResult, NotFound, error_from_response
+from ._wire import (
+    BulkDoc,
+    Entitlement,
+    NodeStatus,
+    NodeVersion,
+    SearchResult,
+    _activate_call,
+    _bulk_body,
+    _Call,
+    _check_complete,
+    _create_index_body,
+    _decode,
+    _document_body,
+    _entitlement_call,
+    _esc,
+    _forcemerge_call,
+    _get_policy_call,
+    _headers,
+    _normalize_base_url,
+    _put_policy_call,
+    _raise_for_status,
+    _search_body,
+    _to_search_result,
+    failed_items,
+)
+from .errors import GnarlError, NotFound
+from .memory import AsyncMemory, Memory
+from .namespaces import AsyncNamespaces, Namespaces
+from .snapshots import AsyncSnapshots, Snapshots
 
 __all__ = [
     "Client",
@@ -33,300 +59,17 @@ __all__ = [
     "BulkDoc",
     "NodeStatus",
     "NodeVersion",
+    "Entitlement",
     "DEFAULT_TIMEOUT",
     "failed_items",
 ]
+
+T = TypeVar("T")
 
 #: Applied when no ``timeout`` is given.
 DEFAULT_TIMEOUT = 30.0
 
 _USER_AGENT = "gnarl-python"
-
-
-# ─── Result types ───────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class SearchResult:
-    """The result of a search."""
-
-    #: Matching documents, best first.
-    hits: list[m.Hit]
-
-    #: Hit-count summary. Read ``total.relation`` before ``total.value``: the
-    #: default is a LOWER BOUND, not an exact count. :attr:`total_is_exact`
-    #: says which.
-    total: m.TotalHits
-
-    #: True when the result may be incomplete because some claims did not
-    #: answer.
-    partial: bool
-
-    #: Auditable claim-level completeness of this search.
-    coverage: m.SearchCoverage
-
-    #: Query execution time in milliseconds, as the node measured it.
-    took: int
-
-    #: Execution timing and per-peer fan-out. Present only when the request
-    #: asked for it with ``profile=True``.
-    profile: m.SearchProfile | None = None
-
-    @property
-    def total_is_exact(self) -> bool:
-        """Whether :attr:`total` is a count rather than a lower bound."""
-        return self.total.relation is m.Relation1.eq
-
-    def sources(self) -> list[dict[str, Any]]:
-        """The ``_source`` of every hit that has one."""
-        return [h.field_source for h in self.hits if h.field_source is not None]
-
-    def __len__(self) -> int:
-        return len(self.hits)
-
-    def __iter__(self) -> Iterator[m.Hit]:
-        return iter(self.hits)
-
-
-@dataclass
-class BulkDoc:
-    """A document with an explicit id, for a bulk request where ids matter."""
-
-    id: str
-    document: Mapping[str, Any]
-
-
-@dataclass(frozen=True)
-class NodeStatus:
-    """A node's self-report.
-
-    The fields mirror the description exactly. There is deliberately no
-    ``version`` here — that is a separate endpoint (:meth:`Client.version`),
-    and an invented field would read as ``None`` forever without ever failing.
-    """
-
-    #: The node's 64-char hex identity.
-    node_id: str
-
-    #: Mesh scope this node is running in: private, public, lan, dev-mesh or
-    #: single-node.
-    mode: str
-
-    #: How many peers this node knows, and how many it can currently reach.
-    #: They differ during a partition, which is the point.
-    peers: int
-    reachable_peers: int
-
-    #: Claim units this node holds, and how many can answer right now.
-    claims: int
-    serving_ready: int
-
-    #: Claims whose storage proof has been verified.
-    proof_verified: int
-
-    #: Absent only for an ephemeral in-memory node.
-    data_dir: str | None = None
-
-    raw: dict[str, Any] = _dc_field(default_factory=dict, repr=False)
-
-    @classmethod
-    def _parse(cls, body: dict[str, Any]) -> NodeStatus:
-        return cls(
-            node_id=body.get("node_id", ""),
-            mode=body.get("mode", ""),
-            peers=body.get("peers", 0),
-            reachable_peers=body.get("reachable_peers", 0),
-            claims=body.get("claims", 0),
-            serving_ready=body.get("serving_ready", 0),
-            proof_verified=body.get("proof_verified", 0),
-            data_dir=body.get("data_dir"),
-            raw=body,
-        )
-
-
-@dataclass(frozen=True)
-class NodeVersion:
-    """The node's build identity, from a different endpoint than status."""
-
-    version: str
-    commit: str | None = None
-
-
-def failed_items(result: m.BulkIndexResponse) -> list[m.BulkItemResult]:
-    """The items in a bulk result that did not succeed.
-
-    Bulk answers 200 with individual failures, so a caller who checks only the
-    HTTP status loses writes without seeing an error. This makes the check a
-    one-liner, so there is no excuse to skip it.
-    """
-    if not result.errors:
-        return []
-    return [it for it in result.items if it.error is not None]
-
-
-# ─── Request plumbing, shared by both clients ───────────────────────────────
-
-
-def _normalize_base_url(addr: str) -> str:
-    """Resolve the base URL.
-
-    A scheme-less address becomes **https**. A node serves TLS by default, and
-    defaulting to http would silently downgrade a caller who wrote
-    ``search.example.com``.
-    """
-    if not addr:
-        raise ValueError("gnarl: empty address")
-    if "://" not in addr:
-        addr = "https://" + addr
-    parsed = httpx.URL(addr)
-    if not parsed.host:
-        raise ValueError(f"gnarl: {addr!r}: no host")
-    return str(parsed).rstrip("/")
-
-
-def _esc(segment: str) -> str:
-    """Escape one path segment. Index names and document ids reach the URL
-    directly, and a document id is caller data that may contain a slash."""
-    return quote(segment, safe="")
-
-
-def _document_body(doc: Mapping[str, Any], doc_id: str | None) -> dict[str, Any]:
-    """Merge a document with an optional ``_id``.
-
-    The wire shape puts document fields at the TOP LEVEL beside ``_id`` rather
-    than under a wrapper, so the id cannot be attached by nesting.
-    """
-    if doc is None:
-        raise ValueError("gnarl: document is None")
-    if not isinstance(doc, Mapping):
-        raise TypeError(
-            f"gnarl: a document must be a mapping, got {type(doc).__name__}"
-        )
-    body = dict(doc)
-    if doc_id is not None:
-        if doc_id == "":
-            raise ValueError("gnarl: empty document id (pass None to have one assigned)")
-        body["_id"] = doc_id
-    return body
-
-
-def _create_index_body(schema: m.IndexSchema) -> dict[str, Any]:
-    """Serialize a schema, sending only what the caller actually declared.
-
-    ``exclude_unset`` and not just ``exclude_none``: several field options
-    carry non-None defaults that apply to one field type only, so without it a
-    plain ``text`` field would arrive carrying ``distance_metric`` and
-    ``quantization``. The node ignores them, but a request should say what was
-    asked for.
-    """
-    return m.CreateIndexRequest(schema=schema).model_dump(
-        mode="json", by_alias=True, exclude_none=True, exclude_unset=True
-    )
-
-
-def _search_body(
-    query: m.Query | None,
-    size: int | None,
-    from_: int | None,
-    sort: Sequence[Any] | None,
-    search_after: Sequence[Any] | None,
-    source: bool | list[str] | None,
-    track_total_hits: bool | None,
-    profile: bool,
-    verify: bool,
-    deadline_ms: int | None,
-) -> dict[str, Any]:
-    # Built as a mapping keyed by WIRE names, then validated, so the request
-    # carries only what the caller actually asked for. Anything absent here
-    # stays unset, and `exclude_unset` keeps it off the wire — which matters
-    # because several fields have a non-None default (`from` is 0, `size` is
-    # 10) that would otherwise be sent back to the node as though the caller
-    # had chosen it.
-    payload: dict[str, Any] = {}
-    if query is not None:
-        payload["query"] = query
-    if size is not None:
-        payload["size"] = size
-    if from_:
-        payload["from"] = from_
-    if sort is not None:
-        payload["sort"] = list(sort)
-    if search_after is not None:
-        payload["search_after"] = list(search_after)
-    if source is not None:
-        payload["_source"] = source
-    if track_total_hits is not None:
-        payload["track_total_hits"] = track_total_hits
-    # `profile` and `verify` each make the node do work it otherwise skips, so
-    # an unconditional `false` would misstate intent even though it costs the
-    # same on the wire.
-    if profile:
-        payload["profile"] = True
-    if verify:
-        payload["verify"] = True
-    if deadline_ms:
-        payload["scope"] = {"deadline_ms": deadline_ms}
-
-    # Validated rather than sent raw: a size past the node's ceiling, or a
-    # deadline below 1 ms, should fail here naming the field rather than as a
-    # 400 the caller has to map back to their own call.
-    req = m.SearchRequest.model_validate(payload)
-    return req.model_dump(
-        mode="json", by_alias=True, exclude_none=True, exclude_unset=True
-    )
-
-
-def _to_search_result(body: dict[str, Any]) -> SearchResult:
-    parsed = m.SearchResponse.model_validate(body)
-    return SearchResult(
-        hits=parsed.hits.hits,
-        total=parsed.hits.total,
-        partial=parsed.partial,
-        coverage=parsed.coverage,
-        took=parsed.took,
-        profile=parsed.profile,
-    )
-
-
-def _check_complete(result: SearchResult) -> None:
-    """Raise if a completeness-requiring search did not get one.
-
-    Both conditions matter. ``partial`` is the node's own verdict; the claim
-    arithmetic catches the case where it was not set but a claim went unserved
-    anyway. The point of asking for completeness is not to trust one flag.
-    """
-    if result.partial or result.coverage.served_claims < result.coverage.expected_claims:
-        raise IncompleteResult(result)
-
-
-def _headers(token: str | None, user_agent: str, has_body: bool) -> dict[str, str]:
-    h = {"Accept": "application/json", "User-Agent": user_agent}
-    if has_body:
-        h["Content-Type"] = "application/json"
-    if token:
-        h["Authorization"] = "Bearer " + token
-    return h
-
-
-def _decode(resp: httpx.Response) -> Any:
-    if not resp.content:
-        return None
-    try:
-        return json.loads(resp.content)
-    except ValueError as exc:
-        raise GnarlError(
-            type="invalid_response",
-            reason=(
-                f"{resp.request.method} {resp.request.url.path}: "
-                f"response was not JSON: {exc}"
-            ),
-            status=resp.status_code,
-        ) from exc
-
-
-def _raise_for_status(resp: httpx.Response) -> None:
-    if resp.status_code < 200 or resp.status_code >= 300:
-        raise error_from_response(resp.status_code, resp.content, resp.headers)
 
 
 # ─── Sync client ────────────────────────────────────────────────────────────
@@ -366,6 +109,13 @@ class Client:
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout, verify=verify)
 
+        #: Namespaces: many lightweight tenants over shared pools.
+        self.namespaces = Namespaces(self)
+        #: Agent memory: remember, recall, answer, ingest.
+        self.memory = Memory(self)
+        #: Backup and restore: repositories, snapshots, schedules, jobs.
+        self.snapshots = Snapshots(self)
+
     # -- lifecycle --
 
     def close(self) -> None:
@@ -398,6 +148,10 @@ class Client:
             ) from exc
         _raise_for_status(resp)
         return _decode(resp) if want_json else None
+
+    def _call(self, call: _Call[T]) -> T:
+        raw = self._do(call.method, call.path, call.body, want_json=call.want_json)
+        return call.parse(raw)
 
     # -- indexes --
 
@@ -581,20 +335,59 @@ class Client:
         """Whether the node answers. Status without the body; raises if not."""
         self._do("GET", "/v1/node/status", want_json=False)
 
+    # -- entitlement --
 
-def _bulk_body(docs: Iterable[Mapping[str, Any] | BulkDoc]) -> dict[str, Any]:
-    encoded: list[dict[str, Any]] = []
-    for i, d in enumerate(docs):
-        try:
-            if isinstance(d, BulkDoc):
-                encoded.append(_document_body(d.document, d.id))
-            else:
-                encoded.append(_document_body(d, None))
-        except (TypeError, ValueError) as exc:
-            raise type(exc)(f"gnarl: bulk: document {i}: {exc}") from exc
-    if not encoded:
-        raise ValueError("gnarl: bulk: no documents")
-    return {"documents": encoded}
+    def entitlement(self) -> Entitlement:
+        """What subscription this node holds: active, refused, unenforced or
+        none. See :class:`Entitlement` for why refused is its own state."""
+        return self._call(_entitlement_call())
+
+    def activate_entitlement(self, key: str) -> Entitlement:
+        """Activate a subscription from a pasted key.
+
+        Takes the one-line ``gnarl-ent1.`` form from the account page, or the
+        raw signed JSON. The node VERIFIES the key before storing it; a refusal
+        raises :class:`~gnarl.ValidationError` whose ``reason`` says which
+        failure it was — malformed, expired, or signed by a key this build does
+        not trust. A node with no data directory raises
+        :class:`~gnarl.Unavailable`. The node keeps its previous mesh scope
+        until it restarts.
+        """
+        return self._call(_activate_call(key))
+
+    # -- index maintenance --
+
+    def forcemerge(
+        self, index: str, *, max_num_segments: int | None = None
+    ) -> m.V1IndexesNameForcemergePostResponse:
+        """Merge an index's segments, down to ``max_num_segments`` per claim
+        (node default 1). Expensive and I/O-heavy: a quiet-period operation.
+
+        Merges only the claims THIS node holds; ``partial`` says when others
+        exist elsewhere.
+        """
+        return self._call(_forcemerge_call(index, max_num_segments))
+
+    def get_policy(self, index: str) -> m.IndexPolicy:
+        """How far the index's data may travel: placement and replicas."""
+        return self._call(_get_policy_call(index))
+
+    def put_policy(
+        self,
+        index: str,
+        *,
+        placement: m.IndexPlacement | str | None = None,
+        replication_factor: int | None = None,
+    ) -> m.IndexPolicy:
+        """Change the placement policy. Returns the policy now in force.
+
+        ORIGIN ONLY: any node but the one that created the index answers
+        :class:`~gnarl.Forbidden`. Omitted fields are unchanged, so this can
+        narrow placement without restating a replication factor. Narrowing
+        DROPS replicas already held, on the next anti-entropy cycle.
+        """
+        return self._call(_put_policy_call(index, placement, replication_factor))
+
 
 
 # ─── Async client ───────────────────────────────────────────────────────────
@@ -622,6 +415,10 @@ class AsyncClient:
         self._user_agent = user_agent
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout, verify=verify)
+
+        self.namespaces = AsyncNamespaces(self)
+        self.memory = AsyncMemory(self)
+        self.snapshots = AsyncSnapshots(self)
 
     async def aclose(self) -> None:
         """Close the underlying connection pool, if this client owns it."""
@@ -651,6 +448,10 @@ class AsyncClient:
             ) from exc
         _raise_for_status(resp)
         return _decode(resp) if want_json else None
+
+    async def _call(self, call: _Call[T]) -> T:
+        raw = await self._do(call.method, call.path, call.body, want_json=call.want_json)
+        return call.parse(raw)
 
     async def create_index(self, name: str, schema: m.IndexSchema) -> None:
         if not name:
@@ -754,3 +555,27 @@ class AsyncClient:
 
     async def ping(self) -> None:
         await self._do("GET", "/v1/node/status", want_json=False)
+
+    async def entitlement(self) -> Entitlement:
+        return await self._call(_entitlement_call())
+
+    async def activate_entitlement(self, key: str) -> Entitlement:
+        return await self._call(_activate_call(key))
+
+    async def forcemerge(
+        self, index: str, *, max_num_segments: int | None = None
+    ) -> m.V1IndexesNameForcemergePostResponse:
+        return await self._call(_forcemerge_call(index, max_num_segments))
+
+    async def get_policy(self, index: str) -> m.IndexPolicy:
+        return await self._call(_get_policy_call(index))
+
+    async def put_policy(
+        self,
+        index: str,
+        *,
+        placement: m.IndexPlacement | str | None = None,
+        replication_factor: int | None = None,
+    ) -> m.IndexPolicy:
+        return await self._call(_put_policy_call(index, placement, replication_factor))
+

@@ -68,6 +68,7 @@ from .client import (
 )
 from .errors import (
     AlreadyExists,
+    Conflict,
     Forbidden,
     GnarlError,
     IncompleteResult,
@@ -75,6 +76,7 @@ from .errors import (
     NotFound,
     RateLimited,
     Unauthenticated,
+    Unavailable,
     Unsupported,
     ValidationError,
 )
@@ -113,6 +115,7 @@ __all__ = [
     # errors
     "GnarlError",
     "NotFound",
+    "Conflict",
     "AlreadyExists",
     "ValidationError",
     "Unauthenticated",
@@ -120,6 +123,7 @@ __all__ = [
     "RateLimited",
     "Unsupported",
     "InternalError",
+    "Unavailable",
     "IncompleteResult",
     "__version__",
 ]

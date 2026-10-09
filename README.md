@@ -102,6 +102,17 @@ except RateLimited as e:
     time.sleep(e.retry_after_or(2.0))
 ```
 
+| class | raised for |
+|---|---|
+| `NotFound` | a missing index, document, field, repository or snapshot — and `route_not_found`, a path this node has no route for |
+| `Conflict` | a 409: `job_in_progress`, `namespace_not_snapshottable` (mid-promotion), `unverified_signer` |
+| `AlreadyExists` | `index_already_exists`; a `Conflict` |
+| `ValidationError` | `validation_error`, `schema_error`, `shared_pool`, and an untyped 400 or 422 |
+| `Unauthenticated` / `Forbidden` | 401 / 403 — including `unauthorized`, which is a wrong BYOK key, not a login problem |
+| `RateLimited` / `Unavailable` | 429 / 503, with `retry_after` when the node gave a hint |
+| `Unsupported` | `unsupported_capability`, `unsupported_engine` |
+| `InternalError` | `internal_error`, `repository_error` |
+
 An error type this client does not recognise still raises a `GnarlError` with
 `type` set, never something more familiar — a caller branching on a guess takes
 the path meant for a different failure.

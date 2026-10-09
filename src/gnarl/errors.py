@@ -18,6 +18,7 @@ from typing import Any
 __all__ = [
     "GnarlError",
     "NotFound",
+    "Conflict",
     "AlreadyExists",
     "ValidationError",
     "Unauthenticated",
@@ -25,6 +26,7 @@ __all__ = [
     "RateLimited",
     "Unsupported",
     "InternalError",
+    "Unavailable",
     "IncompleteResult",
 ]
 
@@ -66,11 +68,23 @@ class GnarlError(Exception):
 
 
 class NotFound(GnarlError):
-    """An index, document, repository or snapshot that is not there."""
+    """An index, document, repository or snapshot that is not there — or no
+    route at that path at all (``route_not_found``), which is how a typo or an
+    endpoint this node does not have presents."""
 
 
-class AlreadyExists(GnarlError):
-    """Creating something that already exists."""
+class Conflict(GnarlError):
+    """The request is valid but cannot happen in the target's current state.
+
+    ``job_in_progress`` (one snapshot job at a time per node),
+    ``namespace_not_snapshottable`` (mid-promotion), ``unverified_signer`` (a
+    restore that needs explicit consent), or an untyped 409. Usually a reason to
+    wait or to change the request, not a reason to give up.
+    """
+
+
+class AlreadyExists(Conflict):
+    """Creating something that already exists. A :class:`Conflict`."""
 
 
 class ValidationError(GnarlError):
@@ -97,6 +111,12 @@ class InternalError(GnarlError):
     """The node failed in a way it does not attribute to the caller."""
 
 
+class Unavailable(GnarlError):
+    """503: the node cannot serve this right now — a claim mid-failover, or
+    nowhere to store what was sent. ``retry_after`` carries the hint when the
+    node gave one."""
+
+
 class IncompleteResult(GnarlError):
     """Raised when ``require_complete`` was set and coverage fell short.
 
@@ -121,21 +141,32 @@ class IncompleteResult(GnarlError):
 # nor remapped to something more familiar, because a caller branching on that
 # guess takes a path meant for a different failure.
 _BY_TYPE: dict[str, type[GnarlError]] = {
+    "validation_error": ValidationError,
+    "schema_error": ValidationError,
+    # Snapshotting a `__pool_N` index without `allow_shared_pool`: a 400 the
+    # caller fixes by changing the request.
+    "shared_pool": ValidationError,
+    "unsupported_capability": Unsupported,
+    "unsupported_engine": Unsupported,
     "index_not_found": NotFound,
     "document_not_found": NotFound,
+    "route_not_found": NotFound,
     "field_not_found": NotFound,
     "repository_not_found": NotFound,
     "snapshot_not_found": NotFound,
     "index_already_exists": AlreadyExists,
-    "validation_error": ValidationError,
-    "schema_error": ValidationError,
     "unauthenticated": Unauthenticated,
-    "unauthorized": Unauthenticated,
+    # NOT an authentication failure despite the name: the node emits it, as a
+    # 403, when a supplied BYOK key does not unwrap the namespace's key. The
+    # caller is authenticated and the KEY is wrong — `Forbidden`, not "log in".
+    "unauthorized": Forbidden,
     "forbidden": Forbidden,
     "rate_limited": RateLimited,
-    "unsupported_capability": Unsupported,
-    "unsupported_engine": Unsupported,
-    "namespace_not_snapshottable": Unsupported,
+    # The node emits this as a 409 while a namespace is mid-promotion: wait for
+    # the promotion and retry. It is a state, not a missing capability.
+    "namespace_not_snapshottable": Conflict,
+    "job_in_progress": Conflict,
+    "unverified_signer": Conflict,
     "internal_error": InternalError,
     "repository_error": InternalError,
 }
@@ -146,8 +177,21 @@ _BY_STATUS: dict[int, type[GnarlError]] = {
     401: Unauthenticated,
     403: Forbidden,
     404: NotFound,
-    409: AlreadyExists,
+    409: Conflict,
     429: RateLimited,
+    503: Unavailable,
+}
+
+# Only for a body with NO envelope. A 400 or 422 with no type is a request the
+# node refused before it could classify it — the framework's own 422 for a body
+# that does not match the declared shape, or a route that answers with plain
+# text, like entitlement activation's refusal. An unknown TYPE on a 400 is
+# different and stays a plain GnarlError: there the node did classify it, just
+# with a name this client does not know.
+_BY_STATUS_UNTYPED: dict[int, type[GnarlError]] = {
+    **_BY_STATUS,
+    400: ValidationError,
+    422: ValidationError,
 }
 
 
@@ -160,6 +204,22 @@ def _retry_after(headers: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return seconds if seconds >= 0 else None
+
+
+def _retry_after_from_detail(detail: Any) -> float | None:
+    """The backoff hint some routes put in the body instead of the header.
+
+    A 503 from a claim mid-failover carries ``detail.retry_after_secs`` and no
+    ``Retry-After`` header, and the rate limiter puts ``retry_after_seconds``
+    in the body as well as the header. The header wins when both are present.
+    """
+    if not isinstance(detail, dict):
+        return None
+    for key in ("retry_after_secs", "retry_after_seconds"):
+        raw = detail.get(key)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+            return float(raw)
+    return None
 
 
 def error_from_response(status: int, body: bytes, headers: Any = None) -> GnarlError:
@@ -183,7 +243,7 @@ def error_from_response(status: int, body: bytes, headers: Any = None) -> GnarlE
         text = body.decode("utf-8", "replace").strip()
         if len(text) > 512:
             text = text[:512] + "…"
-        cls = _BY_STATUS.get(status, GnarlError)
+        cls = _BY_STATUS_UNTYPED.get(status, GnarlError)
         return cls(type="", reason=text, status=status, retry_after=retry_after)
 
     etype = envelope.get("type", "") or ""
@@ -192,10 +252,13 @@ def error_from_response(status: int, body: bytes, headers: Any = None) -> GnarlE
     # envelope was unified.
     reason = envelope.get("reason") or envelope.get("message") or ""
     cls = _BY_TYPE.get(etype) or _BY_STATUS.get(status, GnarlError)
+    detail = envelope.get("detail")
+    if retry_after is None:
+        retry_after = _retry_after_from_detail(detail)
     return cls(
         type=etype,
         reason=reason,
         status=status,
-        detail=envelope.get("detail"),
+        detail=detail,
         retry_after=retry_after,
     )

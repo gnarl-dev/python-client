@@ -4,6 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly, so a server release that breaks this client is found the morning
+  # after it ships rather than by the next pull request that happens to run.
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+  # Sent by lucenia/lucenia when rust/api/openapi.yaml changes on main. The
+  # server repository is private, so this workflow cannot fetch its
+  # description; the server tells it instead. See `spec-freshness`.
+  repository_dispatch:
+    types: [openapi-updated]
 
 jobs:
   unit:
@@ -30,37 +40,17 @@ jobs:
         # Conformance skips here: no node. It has its own job.
         run: pytest -v
 
-  can-reach-a-node:
-    # `lucenia/lucenia` is an INTERNAL repository, so this workflow's own
-    # GITHUB_TOKEN cannot read its releases — an unauthenticated fetch gets a
-    # 404, not a 401, which is what made the first run look like a missing
-    # asset. Downloading a node needs a token with read access to that repo,
-    # stored here as LUCENIA_RELEASE_TOKEN.
-    #
-    # A secret cannot be read from a job-level `if`, so the check is its own
-    # job and the answer becomes an output. The secret's VALUE is never echoed.
-    name: node available?
-    runs-on: ubuntu-latest
-    outputs:
-      available: ${{ steps.check.outputs.available }}
-    steps:
-      - id: check
-        env:
-          TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
-        run: |
-          if [ -n "${TOKEN:-}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-
   conformance:
     # The layer that matters. Importing proves the types match the
     # description; only this proves the description matches the server.
-    name: conformance against a real node
+    #
+    # The node comes from the PUBLIC release repository, gnarl-dev/releases —
+    # the same binary a user installs — so this needs no secret and runs on
+    # every pull request, including one from a fork. (It used to download from
+    # lucenia/lucenia, which is internal; with no token configured it never ran
+    # at all.)
+    name: conformance against a released node
     runs-on: ubuntu-latest
-    needs: can-reach-a-node
-    if: needs.can-reach-a-node.outputs.available == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -68,18 +58,33 @@ jobs:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
 
-      - name: Fetch a node
+      - name: Fetch the latest released node
         env:
-          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+          # A public repository: the workflow's own token is enough, and gh
+          # wants one even for public reads.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=$(gh release view --repo lucenia/lucenia --json tagName -q .tagName)
-          echo "using $tag"
-          gh release download "$tag" --repo lucenia/lucenia \
-            --pattern 'lucenia-x86_64-unknown-linux-gnu.tar.gz' --output node.tar.gz
-          tar xzf node.tar.gz
-          # A node runs JVM-free on the native engine, so no Java is needed.
-          echo "LUCENIA_BIN=$PWD/lucenia" >> "$GITHUB_ENV"
+          case "$(uname -m)" in
+            x86_64)          triple=x86_64-unknown-linux-gnu ;;
+            aarch64|arm64)   triple=aarch64-unknown-linux-gnu ;;
+            *) echo "::error::no released node for $(uname -m)"; exit 1 ;;
+          esac
+          asset="gnarl-${triple}.tar.gz"
+          tag=$(gh release view --repo gnarl-dev/releases --json tagName -q .tagName)
+          echo "using gnarl-dev/releases $tag ($asset)"
+          echo "### Node: gnarl-dev/releases \`$tag\` ($triple)" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p node && cd node
+          gh release download "$tag" --repo gnarl-dev/releases \
+            --pattern "$asset" --pattern SHA256SUMS.txt
+          # Checked against the release's own manifest, so a truncated or
+          # substituted download fails here rather than as a confusing boot.
+          grep " \./${asset}\$\| ${asset}\$" SHA256SUMS.txt | sed 's# \./# #' | sha256sum -c -
+          tar xzf "$asset"
+          # The released binary is named `gnarl`. It runs JVM-free on the
+          # native engine, so no Java is needed.
+          test -x gnarl
+          echo "LUCENIA_BIN=$PWD/gnarl" >> "$GITHUB_ENV"
 
       - name: Conformance and doc tests
         # Named explicitly rather than run as a bare `pytest`: if the harness
@@ -89,6 +94,7 @@ jobs:
         run: pytest tests/conformance -v --junitxml=conformance.xml
 
       - name: The conformance suite actually ran
+        if: always()
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -96,48 +102,12 @@ jobs:
           suite = ET.parse("conformance.xml").getroot().find("testsuite")
           ran = int(suite.get("tests")) - int(suite.get("skipped"))
           print(f"{ran} conformance tests executed")
-          if ran < 30:
+          if ran < 80:
               sys.exit(
                   f"only {ran} conformance tests executed — the harness found "
                   "no node and skipped, which passes without proving anything"
               )
           PY
-
-  conformance-status:
-    # A skipped job shows as a grey tick, and a wall of green ticks where one
-    # of them means "did not run" is how a suite stops being read. This job
-    # always runs and says, in the summary, whether the layer that matters
-    # actually ran.
-    name: conformance ran?
-    runs-on: ubuntu-latest
-    needs: [can-reach-a-node, conformance]
-    if: always()
-    steps:
-      - name: Report
-        run: |
-          if [ "${{ needs.can-reach-a-node.outputs.available }}" != "true" ]; then
-            {
-              echo "### Conformance did NOT run"
-              echo
-              echo "No \`LUCENIA_RELEASE_TOKEN\` secret, so no node could be"
-              echo "downloaded — \`lucenia/lucenia\` is internal and this"
-              echo "workflow's own token cannot read it."
-              echo
-              echo "Everything green above is unit, integration, regression"
-              echo "and spec-drift. **None of it talked to a server.**"
-              echo
-              echo "Set the secret from a real terminal (\`gh secret set\`"
-              echo "through a non-interactive shell stores an EMPTY value and"
-              echo "still exits 0) with a token that can read that repo's"
-              echo "releases."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          if [ "${{ needs.conformance.result }}" != "success" ]; then
-            echo "conformance: ${{ needs.conformance.result }}" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "### Conformance ran against a real node" >> "$GITHUB_STEP_SUMMARY"
 
   spec-drift:
     # The generated layer must match the description it claims to come from.
@@ -149,58 +119,66 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install 'datamodel-code-generator>=0.82'
+      # Pinned exactly, generator AND formatters: an unpinned black reformats
+      # the file on the runner and fails a pull request that changed nothing.
+      - run: pip install -r requirements-codegen.txt
       - name: Regenerate and diff
         run: |
           set -euo pipefail
-          datamodel-codegen \
-            --input src/gnarl/openapi.yaml --input-file-type openapi \
-            --output src/gnarl/_models.py --output-model-type pydantic_v2.BaseModel \
-            --target-python-version 3.10 --use-standard-collections \
-            --use-union-operator --field-constraints --use-schema-description \
-            --collapse-root-models --deserialize-default-values enum \
-            --use-default-kwarg
-          # The timestamp line changes on every run and means nothing.
-          if ! git diff --exit-code --ignore-matching-lines='^#   timestamp:' \
-               -- src/gnarl/_models.py; then
+          # The same script a developer runs (`make models`), so there is one
+          # regeneration command rather than two that drift apart.
+          CODEGEN=datamodel-codegen scripts/regen-models.sh
+          # Byte for byte: the generator runs with --disable-timestamp, so
+          # there is no line that is allowed to differ.
+          if ! git diff --exit-code -- src/gnarl/_models.py; then
             echo
             echo "src/gnarl/_models.py does not match src/gnarl/openapi.yaml."
-            echo "It is generated — edit the spec and regenerate; see the"
-            echo "command in README.md."
+            echo "It is generated — edit the spec and run scripts/regen-models.sh"
+            echo "(or \`make models\`)."
             exit 1
           fi
 
   spec-freshness:
-    # The OTHER half of spec-drift, and the half that was missing.
+    # The OTHER half of spec-drift. `spec-drift` proves the models match the
+    # VENDORED description; this proves the vendored description matches the
+    # server's. A client can be perfectly self-consistent and perfectly stale.
     #
-    # `spec-drift` regenerates the models and diffs them against the VENDORED
-    # description — so it proves this client is internally consistent and says
-    # nothing about whether the vendored copy matches the server's. A client
-    # can be perfectly self-consistent and perfectly stale, and this one was:
-    # it shipped a description that predated the `SearchProfile` fix the client
-    # itself uncovered.
+    # lucenia/lucenia is private, so this workflow cannot fetch the server's
+    # description. Instead the server's CI, on every change to
+    # rust/api/openapi.yaml on main, sends:
     #
-    # Gated on the same token as conformance, because `lucenia/lucenia` is
-    # internal.
+    #   gh api repos/gnarl-dev/python-client/dispatches \
+    #     -f event_type=openapi-updated \
+    #     -F client_payload[sha256]=<sha256 of rust/api/openapi.yaml> \
+    #     -F client_payload[ref]=<commit>
+    #
+    # and this job compares that hash with the vendored copy's: a byte-for-byte
+    # comparison without the bytes. A mismatch is a red run on main that says
+    # which server commit to re-vendor from (`make vendor` beside a lucenia
+    # checkout). It runs only for that event, because on any other trigger
+    # there is nothing to compare against.
     name: vendored description is current
+    if: github.event_name == 'repository_dispatch'
     runs-on: ubuntu-latest
-    needs: can-reach-a-node
-    if: needs.can-reach-a-node.outputs.available == 'true'
     steps:
       - uses: actions/checkout@v4
-      - name: Diff against the server's description
+      - name: Compare with the server's description
         env:
-          GH_TOKEN: ${{ secrets.LUCENIA_RELEASE_TOKEN }}
+          UPSTREAM_SHA256: ${{ github.event.client_payload.sha256 }}
+          UPSTREAM_REF: ${{ github.event.client_payload.ref }}
         run: |
           set -euo pipefail
-          gh api repos/lucenia/lucenia/contents/rust/api/openapi.yaml \
-            --jq '.content' | base64 -d > /tmp/upstream.yaml
-          if ! diff -u /tmp/upstream.yaml src/gnarl/openapi.yaml; then
-            echo
-            echo "::error::src/gnarl/openapi.yaml is not the server's current"
-            echo "description. Re-vendor it and regenerate the models — see the"
-            echo "command in README.md. A stale contract is how a generated"
-            echo "client goes on describing an API the server no longer has."
+          if ! printf '%s' "${UPSTREAM_SHA256:-}" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::dispatch carried no valid client_payload.sha256"
             exit 1
           fi
-          echo "vendored description matches lucenia/lucenia main"
+          ours=$(sha256sum src/gnarl/openapi.yaml | cut -d' ' -f1)
+          if [ "$ours" != "$UPSTREAM_SHA256" ]; then
+            echo "::error::src/gnarl/openapi.yaml is not the server's current"
+            echo "description (lucenia/lucenia@${UPSTREAM_REF:-unknown})."
+            echo "Re-vendor it and regenerate: \`make vendor\` beside a lucenia"
+            echo "checkout. A stale contract is how a generated client goes on"
+            echo "describing an API the server no longer has."
+            exit 1
+          fi
+          echo "vendored description matches lucenia/lucenia@${UPSTREAM_REF:-unknown}"

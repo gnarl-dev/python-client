@@ -3,21 +3,30 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from gnarl.errors import (
+    _BY_TYPE,
     AlreadyExists,
+    Conflict,
     Forbidden,
     GnarlError,
     InternalError,
     NotFound,
     RateLimited,
     Unauthenticated,
+    Unavailable,
     Unsupported,
     ValidationError,
     error_from_response,
+)
+
+SPEC = yaml.safe_load(
+    (Path(__file__).parent.parent / "src/gnarl/openapi.yaml").read_text()
 )
 
 
@@ -40,6 +49,16 @@ def envelope(type_: str, reason: str = "because", **extra) -> bytes:
         ("unsupported_capability", 400, Unsupported),
         ("unsupported_engine", 400, Unsupported),
         ("internal_error", 500, InternalError),
+        ("route_not_found", 404, NotFound),
+        ("field_not_found", 404, NotFound),
+        ("repository_not_found", 404, NotFound),
+        ("snapshot_not_found", 404, NotFound),
+        ("repository_error", 502, InternalError),
+        ("shared_pool", 400, ValidationError),
+        ("namespace_not_snapshottable", 409, Conflict),
+        ("job_in_progress", 409, Conflict),
+        ("unverified_signer", 409, Conflict),
+        ("unauthorized", 403, Forbidden),
     ],
 )
 def test_each_type_maps_to_its_class(type_, status, expected):
@@ -157,3 +176,96 @@ def test_a_long_unstructured_body_is_truncated_not_dropped():
     err = error_from_response(500, b"x" * 5000)
     assert len(err.reason) < 600
     assert err.reason.startswith("xxx")
+
+
+def test_every_type_the_description_declares_is_mapped():
+    """A type in the server's enum with no entry here degrades to a status
+    guess — or, on a status with no fallback, to a bare GnarlError that no
+    ``except`` clause in the README catches. Re-vendoring a description that
+    adds a type fails here until the type is classified."""
+    declared = set(
+        SPEC["components"]["schemas"]["ErrorBody"]["properties"]["type"]["enum"]
+    )
+    assert declared - set(_BY_TYPE) == set(), "unmapped error types"
+    assert set(_BY_TYPE) - declared == set(), (
+        "mapped types the description does not declare; the server may have "
+        "removed or renamed them"
+    )
+
+
+def test_a_route_that_does_not_exist_is_not_found_not_a_200():
+    """Before `route_not_found`, an unmatched /v1 path fell through to the
+    Console's SPA and answered 200 with HTML."""
+    err = error_from_response(404, envelope("route_not_found", "no route at /v1/indices"))
+    assert isinstance(err, NotFound)
+    assert err.type == "route_not_found"
+
+
+def test_a_wrong_byok_key_is_forbidden_not_unauthenticated():
+    """`unauthorized` is the node's name for a KEK that does not unwrap the
+    namespace's key, sent as 403. Classified as Unauthenticated, a caller
+    would re-authenticate — with a token that was never the problem."""
+    err = error_from_response(403, envelope("unauthorized"))
+    assert isinstance(err, Forbidden)
+    assert not isinstance(err, Unauthenticated)
+
+
+def test_already_exists_is_a_conflict():
+    """`except Conflict` catches every 409; `except AlreadyExists` still
+    catches exactly the one it always did."""
+    err = error_from_response(409, envelope("index_already_exists"))
+    assert isinstance(err, AlreadyExists)
+    assert isinstance(err, Conflict)
+    other = error_from_response(409, envelope("job_in_progress"))
+    assert isinstance(other, Conflict)
+    assert not isinstance(other, AlreadyExists)
+
+
+def test_an_untyped_409_is_a_conflict_not_already_exists():
+    """A bare 409 — a locked keyed namespace, a reused idempotency key — is not
+    evidence that something already exists."""
+    err = error_from_response(409, b"Namespace is keyed but locked")
+    assert type(err) is Conflict
+
+
+def test_a_plain_text_400_is_a_validation_error():
+    """Entitlement activation refuses a key with a plain-text 400 naming why.
+    With no envelope there is no type to misread, so the status decides."""
+    err = error_from_response(400, b"entitlement expired at 1700000000")
+    assert isinstance(err, ValidationError)
+    assert "expired" in err.reason
+
+
+def test_the_frameworks_plain_text_422_is_a_validation_error():
+    err = error_from_response(422, b"Failed to deserialize the JSON body")
+    assert isinstance(err, ValidationError)
+
+
+def test_an_unknown_type_on_a_400_is_still_not_a_validation_error():
+    """The untyped fallback must not leak into the typed path: the node DID
+    classify this one, under a name this client does not know."""
+    err = error_from_response(400, envelope("some_future_type"))
+    assert type(err) is GnarlError
+
+
+def test_a_503_is_unavailable():
+    err = error_from_response(503, b"")
+    assert isinstance(err, Unavailable)
+
+
+def test_retry_after_falls_back_to_the_body():
+    """A claim mid-failover answers 503 with `detail.retry_after_secs` and no
+    header. Reading only the header turns the node's hint into None."""
+    err = error_from_response(
+        503, envelope("internal_error", detail={"retry_after_secs": 1})
+    )
+    assert err.retry_after == 1.0
+
+
+def test_the_header_wins_over_the_body():
+    err = error_from_response(
+        429,
+        envelope("rate_limited", detail={"retry_after_seconds": 9}),
+        httpx.Headers({"Retry-After": "2"}),
+    )
+    assert err.retry_after == 2.0

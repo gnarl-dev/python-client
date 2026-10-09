@@ -16,7 +16,9 @@ The harness finds a node in this order, and says exactly what to do if it
 cannot:
 
 1. ``$GNARL_TEST_NODE`` — a node you already have running.
-2. ``$LUCENIA_BIN`` — a ``lucenia`` binary the harness starts and stops itself.
+2. ``$LUCENIA_BIN`` (or ``$GNARL_BIN``) — a node binary the harness starts and
+   stops itself: ``lucenia`` from a source build, or ``gnarl`` from a release
+   at github.com/gnarl-dev/releases, which is what CI uses.
 3. a ``lucenia`` binary in the sibling lucenia checkout's target directory.
 
 A node runs without a JVM on the native engine, so no Java toolchain is needed.
@@ -53,7 +55,7 @@ BOOT_TIMEOUT = 60.0
 
 
 def _candidate_binaries() -> list[Path]:
-    explicit = os.environ.get("LUCENIA_BIN")
+    explicit = os.environ.get("LUCENIA_BIN") or os.environ.get("GNARL_BIN")
     if explicit:
         return [Path(explicit)]
     here = Path(__file__).resolve().parents[2]

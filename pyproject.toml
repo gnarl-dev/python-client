@@ -3,8 +3,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "gnarl"
-version = "0.1.0"
+# The DISTRIBUTION is `gnarl-client`; the import name stays `gnarl`. PyPI's
+# `gnarl` is an unrelated project, so `pip install gnarl` installs somebody
+# else's code under the name a reader expects to be ours.
+name = "gnarl-client"
+version = "0.2.0"
 description = "Python client for Gnarl, a decentralized search fabric"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1,0 +1,12 @@
+# The generator and the formatters it runs, pinned EXACTLY.
+#
+# `src/gnarl/_models.py` is checked in and CI regenerates it and diffs the
+# result, so the output has to be a pure function of the description. A range
+# like `>=0.82` lets a new generator or a new black reformat the file on CI and
+# fail a pull request that changed nothing — or worse, pass one on a laptop and
+# fail it on the runner. Bump these deliberately, regenerate, and commit both.
+#
+# Used by scripts/regen-models.sh (`make models`) and by CI's spec-drift job.
+datamodel-code-generator==0.83.0
+black==26.10.0
+isort==8.0.1

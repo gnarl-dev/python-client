@@ -6,8 +6,12 @@ A node is a peer, not a coordinator, so there is no cluster endpoint to point
 at. You talk to a node and it answers for the mesh. Any node will do.
 
 ```bash
-pip install gnarl
+pip install gnarl-client
 ```
+
+The package is **`gnarl-client`** and the import is **`gnarl`**. The bare
+name `gnarl` on PyPI belongs to an unrelated project — installing it gets you
+somebody else's code.
 
 ## Quick start
 
@@ -85,7 +89,10 @@ except ValidationError as e:
 ```
 
 Each one carries `type`, `reason`, `status`, an optional `detail`, and
-`retry_after` on a 429:
+`retry_after` on a 429 or 503. The client has usually already retried by the
+time you see one — see [Retries](#retries) — so this is what is left when the
+node kept saying "not now", or asked for a longer wait than the client will
+make on its own:
 
 ```python
 import time
@@ -98,9 +105,41 @@ except RateLimited as e:
     time.sleep(e.retry_after_or(2.0))
 ```
 
+| class | raised for |
+|---|---|
+| `NotFound` | a missing index, document, field, repository or snapshot — and `route_not_found`, a path this node has no route for |
+| `Conflict` | a 409: `job_in_progress`, `namespace_not_snapshottable` (mid-promotion), `unverified_signer` |
+| `AlreadyExists` | `index_already_exists`; a `Conflict` |
+| `ValidationError` | `validation_error`, `schema_error`, `shared_pool`, and an untyped 400 or 422 |
+| `Unauthenticated` / `Forbidden` | 401 / 403 — including `unauthorized`, which is a wrong BYOK key, not a login problem |
+| `RateLimited` / `Unavailable` | 429 / 503, with `retry_after` when the node gave a hint |
+| `Unsupported` | `unsupported_capability`, `unsupported_engine` |
+| `InternalError` | `internal_error`, `repository_error` |
+
 An error type this client does not recognise still raises a `GnarlError` with
 `type` set, never something more familiar — a caller branching on a guess takes
 the path meant for a different failure.
+
+
+## Retries
+
+A 429 or 503 means "not now", so the client sends the request again — but only
+a request that is safe to repeat: GET, PUT, DELETE, and the POSTs that change
+nothing (`search`, `iter_search`, `memory.recall`, `memory.answer`,
+`namespaces.search`). A write that may have landed is never resent, because a
+second `index_document` without an id is a second document.
+
+The node's `Retry-After` is honoured exactly. When it asks for longer than the
+cap, the error is raised straight away rather than retried early — asking again
+before the node said to is how a client gets itself limited harder.
+
+```python
+from gnarl import Client, Retry
+
+c = Client("https://localhost:8080", verify=False,
+           retry=Retry(attempts=5, max_delay=60.0))   # the default is 3 and 30s
+c = Client("https://localhost:8080", verify=False, retry=None)   # off
+```
 
 ## Completeness
 
@@ -205,17 +244,155 @@ for item in failed_items(result):
     print("failed:", item.field_id, item.error.reason)
 ```
 
+For more than one request's worth, `bulk_chunked` sends `chunk_size` documents
+at a time from any iterable — a generator over a large file never sits in
+memory whole — and merges the results in order, so `failed_items` still works
+on the whole batch:
+
+```python
+from gnarl import BulkDoc, Client, failed_items, query as q
+
+c = Client("https://localhost:8080", verify=False)
+if not c.index_exists("readings"):
+    c.create_index("readings", q.schema({"seq": q.long_field()}))
+
+docs = (BulkDoc(f"r{i:05}", {"seq": i}) for i in range(1_200))
+result = c.bulk_chunked("readings", docs, chunk_size=500)
+assert not failed_items(result)
+```
+
+The merged `ack` is the weakest level any chunk reached. A chunk refused as a
+whole raises, with the chunks before it already written — explicit ids make a
+rerun overwrite rather than duplicate.
+
+## Reading a whole result set
+
+`iter_search` pages with `search_after`, which costs the same on page 1,000 as
+on page one; a deep `from_` makes every claim collect `from + size` rows:
+
+```python
+from gnarl import Client, query as q
+
+c = Client("https://localhost:8080", verify=False)
+seqs = [h.field_source["seq"] for h in c.iter_search("readings", sort=["seq"], page_size=200)]
+print(len(seqs), "readings, in order")
+```
+
+`sort` is required — each hit's sort values are the cursor, with `_id` appended
+by the node as the tiebreaker — and must name a sortable field: a number, a
+date or a boolean. Keyword and text fields are refused as sort keys. Iteration ends at an EMPTY page, not a short
+one, because a page can be short when a claim missed its deadline; pass
+`require_complete=True` to make such a page raise instead.
+
+## Namespaces
+
+Many lightweight tenants over shared pools. A namespace exists from its first
+write, and every read is fenced to it by a filter the node applies and the
+caller cannot override:
+
+```python
+from gnarl import Client, query as q
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.namespaces.index_document(
+        "tenant-a", {"subject": "invoice overdue"}, id="t1", wait_for="visible"
+    )
+    res = c.namespaces.search("tenant-a", q.match("subject", "invoice"))
+    print([h.field_id for h in res])
+```
+
+`wait_for="visible"` returns once the write is searchable, so the search right
+after it sees it. Without it a write is acknowledged when it is DURABLE, which
+comes first.
+
+`c.namespaces` also has `bulk`, `get_document`, `delete_document`, `list`,
+`put_mapping` (declare a `dense_vector` field, which gives the namespace a
+dedicated index), `promote`, and the bring-your-own-key trio `set_key`,
+`key_status` and `revoke_key`. `list()` follows every page and reports
+`partial` when a peer did not answer: the catalog is not replicated, so an
+unreachable peer means a namespace may be missing.
+
+## Agent memory
+
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.memory.remember("the boat is moored at pier 4", namespace="deckhand")
+    found = c.memory.recall("where is the boat", namespace="deckhand", k=3)
+    for mem in found.memories:
+        print(f"{mem.score:.2f}  {mem.content}")
+```
+
+Embedding happens on the node. `answer()` composes over what `recall` finds,
+and `ingest_document`, `ingest_messages` and `ingest_voice` take files, chat
+transcripts and voice notes. `ingest_document` requires `space`: `personal`
+stays on the device and `household` is replicated to the mesh's peers, so there
+is deliberately no default.
+
+## Subscription
+
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    ent = c.entitlement()
+    print(ent.state)            # active, refused, unenforced or none
+    if ent.expires_at:
+        print("renews by", ent.expires_at.date())
+```
+
+`refused` is not `none`: a key is present and was rejected — expired, or signed
+by a key this build does not trust — and the person holding it has paid.
+`not_after` on the wire is epoch **seconds**; `expires_at` reads it as such.
+Activate a key from the account page with `c.activate_entitlement(key)`; a
+refusal raises `ValidationError` whose `reason` says which failure it was.
+
+## Backup and restore
+
+<!-- doctest: skip because it writes a repository to a directory on the node's host -->
+```python
+from gnarl import Client
+
+with Client("https://localhost:8080", verify=False) as c:
+    c.snapshots.register_repository("local", {"type": "fs", "location": "/var/backups/gnarl"})
+    job = c.snapshots.create("local", "places-1", index="places")
+    done = c.snapshots.wait(job)              # raises JobFailed if it failed
+    print(done.result)
+
+    c.snapshots.set_schedule("local", "places", every_hours=24)
+```
+
+Snapshot, restore and cleanup run in the background, one at a time per node;
+each returns a job and `wait()` polls it to the end. A second job while one is
+running raises `Conflict`. A restore refuses a snapshot this node cannot
+attribute to itself or a known peer until you pass the signer's key or consent
+with `allow_unverified_signer=True`, and refuses to roll a live index back
+without `allow_overwrite_live_index=True`.
+
+## Index maintenance
+
+`c.forcemerge(index)` merges segments (expensive; for a quiet period), and
+`c.get_policy(index)` / `c.put_policy(index, placement="local")` read and narrow
+how far an index's data may travel. Only the node that created an index may
+change its policy; any other answers `Forbidden`.
+
 ## Authentication
 
 A node with RBAC enabled exempts loopback callers, so a local node usually
 needs no token. A remote one always does:
 
+<!-- doctest: skip because it needs a remote node and a token -->
 ```python
-import os
 from gnarl import Client
 
-c = Client("https://node.example.com", token=os.environ["GNARL_TOKEN"])
+c = Client("https://node.example.com", token="...")
+c = Client()      # reads $GNARL_URL, and $GNARL_TOKEN for the token
 ```
+
+With no address, the client reads `GNARL_URL`; with no token, `GNARL_TOKEN`.
+The token is then sent to whatever address the client talks to, so pass
+`token=""` to send none.
 
 See [Connecting](#connecting) for what the node's certificate means for the
 `verify` argument.
@@ -227,21 +404,26 @@ never edited by hand, so the payload types cannot drift from the server.
 Everything else is written by hand, so it can be idiomatic. Regenerate with:
 
 ```bash
-datamodel-codegen \
-  --input src/gnarl/openapi.yaml --input-file-type openapi \
-  --output src/gnarl/_models.py --output-model-type pydantic_v2.BaseModel \
-  --target-python-version 3.10 --use-standard-collections --use-union-operator \
-  --field-constraints --use-schema-description --collapse-root-models \
-  --deserialize-default-values enum --use-default-kwarg
+make models          # = scripts/regen-models.sh
+make vendor          # copy ../lucenia/rust/api/openapi.yaml in, then regenerate
 ```
 
-The last two flags are not cosmetic. Without `--deserialize-default-values
-enum`, an enum-typed field with a default holds the raw string and pydantic
-emits a serialization warning on every request — which under
-`filterwarnings = ["error"]` is how the test suite found it. Without
-`--use-default-kwarg`, `Field(None, ...)` passes the default positionally,
-mypy cannot see it through `dataclass_transform`, and every optional field
-reads as required: 177 spurious strict-mode errors.
+The script is the only regeneration command: CI's spec-drift job runs it and
+compares the result byte for byte. The generator **and the formatters it runs**
+are pinned exactly in `requirements-codegen.txt` and installed into their own
+`.venv-codegen`, because an unpinned black reformats the file on a runner and
+fails a pull request that changed nothing. To move to a newer generator, bump
+the pins, regenerate, and commit both together.
+
+Several flags are not cosmetic. Without `--deserialize-default-values enum`, an
+enum-typed field with a default holds the raw string and pydantic emits a
+serialization warning on every request — which under `filterwarnings =
+["error"]` is how the test suite found it. Without `--use-default-kwarg`,
+`Field(None, ...)` passes the default positionally, mypy cannot see it through
+`dataclass_transform`, and every optional field reads as required: 177 spurious
+strict-mode errors. `--openapi-scopes schemas paths` gives the inline request
+and response shapes (entitlement, memory, namespaces, schedules) models of their
+own, and `--disable-timestamp` makes the output a pure function of the input.
 
 The description is vendored at `src/gnarl/openapi.yaml` and ships in the wheel:
 a user debugging a response should be able to read the contract out of the
@@ -255,8 +437,8 @@ Four layers:
 |---|---|---|
 | unit | `tests/test_query.py`, `tests/test_errors.py` | builders emit the exact wire shape; every error body parses |
 | regression | `tests/test_regressions.py` | defects that shipped once stay fixed |
-| integration | `tests/test_client.py` | the full request/response path over a mocked transport |
-| smoke + conformance | `tests/conformance/` | a real node boots and answers real HTTP |
+| integration | `tests/test_client.py`, `tests/test_api_surface.py`, `tests/test_ergonomics.py` | the full request/response path over a mocked transport, through both the sync and the async client |
+| smoke + conformance | `tests/conformance/` | a real node boots and answers real HTTP; `test_ga_surface.py` drives entitlement, namespaces, memory, snapshots, forcemerge and the iterators |
 
 Compiling — or in Python, importing — proves the types match the description.
 It does not prove the description matches the server, and that gap is where
@@ -267,6 +449,18 @@ pytest                                            # everything but conformance
 LUCENIA_BIN=/path/to/lucenia pytest               # starts a node, runs it all
 GNARL_TEST_NODE=https://localhost:8080 pytest     # uses a node you have
 ```
+
+CI runs conformance against the latest public release from
+[gnarl-dev/releases](https://github.com/gnarl-dev/releases) — the binary a user
+installs, checked against the release's `SHA256SUMS.txt` — on every pull
+request and nightly, with no secret. Any release's `gnarl` binary works locally
+the same way: `LUCENIA_BIN=/path/to/gnarl pytest`.
+
+The vendored description is checked against the server's by a
+`repository_dispatch` (`openapi-updated`) the server repository sends when its
+description changes, carrying the SHA-256 of `rust/api/openapi.yaml`. The
+server repository is private, so this workflow cannot fetch it; the hash is a
+byte-for-byte comparison without the bytes.
 
 The README's examples are executed by `tests/test_readme_examples.py` against a
 live node, so a snippet here that does not work is a failing test rather than a

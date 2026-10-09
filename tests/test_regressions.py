@@ -260,3 +260,57 @@ def test_a_nan_or_infinite_coordinate_is_refused_before_the_wire():
     for bad in (math.nan, math.inf, -math.inf):
         with pytest.raises(ValueError):
             q.geo_distance("location", bad, 0.0, 100.0)
+
+
+ROOT = __import__("pathlib").Path(__file__).parent.parent
+
+
+def test_the_generator_is_pinned_exactly():
+    """CI installed `datamodel-code-generator>=0.82`.
+
+    `_models.py` is checked in and CI regenerates and diffs it, so the output
+    must be a pure function of the description. A range — on the generator OR
+    on the black/isort it formats with — lets a new release reformat the file
+    on the runner and fail a pull request that changed nothing.
+    """
+    pins = [
+        line.strip()
+        for line in (ROOT / "requirements-codegen.txt").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    names = {p.split("==")[0] for p in pins}
+    assert names == {"datamodel-code-generator", "black", "isort"}
+    assert all("==" in p and not any(c in p for c in "<>~*") for p in pins), pins
+
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "pip install -r requirements-codegen.txt" in ci
+    assert "scripts/regen-models.sh" in ci
+    assert "datamodel-code-generator>=" not in ci
+
+
+def test_the_generated_models_carry_no_timestamp():
+    """The header used to carry a timestamp, so CI had to diff with
+    `--ignore-matching-lines` — which is a byte-compare with a hole in it.
+    Generated with `--disable-timestamp`, nothing is allowed to differ."""
+    header = (ROOT / "src/gnarl/_models.py").read_text().splitlines()[:5]
+    assert not any("timestamp" in line for line in header), header
+
+
+def test_conformance_needs_no_private_token():
+    """Conformance and spec-freshness were gated on a LUCENIA_RELEASE_TOKEN
+    secret that was never set, so the layer that talks to a real node had
+    never run in CI. The node now comes from the public release repository."""
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "LUCENIA_RELEASE_TOKEN" not in ci
+    assert "--repo gnarl-dev/releases" in ci
+    assert "repos/lucenia/lucenia" not in ci, "the server repository is private"
+
+
+def test_ci_runs_nightly_and_on_a_spec_dispatch():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    # YAML 1.1 reads a bare `on:` key as the boolean True.
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["schedule"], "no nightly run"
+    assert "openapi-updated" in triggers["repository_dispatch"]["types"]
+    freshness = workflow["jobs"]["spec-freshness"]
+    assert "repository_dispatch" in freshness["if"]

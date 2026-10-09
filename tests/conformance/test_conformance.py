@@ -195,26 +195,26 @@ def test_bulk_indexes_every_document(client: Client, index):
     searchable(client, name, q.term("tag", "dawn"), 3)
 
 
-def test_a_type_mismatch_rejects_the_whole_batch(client: Client, index):
-    """What the node actually does, which is not what the response shape
-    suggests.
+def test_a_type_mismatch_fails_that_item_and_not_the_batch(client: Client, index):
+    """A document whose value does not fit the field's type fails ITSELF, with
+    a per-item 400 that names the field, and the rest of the batch lands.
 
-    `BulkIndexResponse` carries a per-item `error` and an `errors` flag, so the
-    shape can express "these three failed, the rest landed". A document whose
-    value does not fit the field's type never reaches that path: conversion
-    happens for the whole batch before any write, and the first failure returns
-    a single 400 for the request.
-
-    Asserted as it is rather than as it should be — a conformance suite records
-    the contract, it does not wish for one. The product question (one bad
-    document losing 999 good ones, and the error not naming which) is filed
-    separately.
+    This used to be the opposite: conversion ran for the whole batch before any
+    write, and one bad document returned a single 400 for the request — losing
+    every good document with it, and not saying which one was bad. The node
+    changed, and this records what it does now. It is also exactly the case
+    `failed_items` exists for: a 200 that did not write everything.
     """
     name = index(q.schema({"count": q.integer_field()}))
-    with pytest.raises(ValidationError) as caught:
-        client.bulk(name, [{"count": 1}, {"count": "not a number"}])
-    assert caught.value.reason
-    assert client.count(name) == 0, "part of a rejected batch was written anyway"
+    result = client.bulk(
+        name, [BulkDoc("good", {"count": 1}), BulkDoc("bad", {"count": "not a number"})]
+    )
+    assert result.errors is True
+    failed = failed_items(result)
+    assert [i.field_id for i in failed] == ["bad"]
+    assert failed[0].status == 400
+    assert "count" in failed[0].error.reason
+    assert client.get_document(name, "good") == {"count": 1}
 
 
 def test_a_bulk_result_reports_per_item_outcomes(client: Client, index):

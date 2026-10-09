@@ -231,21 +231,26 @@ never edited by hand, so the payload types cannot drift from the server.
 Everything else is written by hand, so it can be idiomatic. Regenerate with:
 
 ```bash
-datamodel-codegen \
-  --input src/gnarl/openapi.yaml --input-file-type openapi \
-  --output src/gnarl/_models.py --output-model-type pydantic_v2.BaseModel \
-  --target-python-version 3.10 --use-standard-collections --use-union-operator \
-  --field-constraints --use-schema-description --collapse-root-models \
-  --deserialize-default-values enum --use-default-kwarg
+make models          # = scripts/regen-models.sh
+make vendor          # copy ../lucenia/rust/api/openapi.yaml in, then regenerate
 ```
 
-The last two flags are not cosmetic. Without `--deserialize-default-values
-enum`, an enum-typed field with a default holds the raw string and pydantic
-emits a serialization warning on every request — which under
-`filterwarnings = ["error"]` is how the test suite found it. Without
-`--use-default-kwarg`, `Field(None, ...)` passes the default positionally,
-mypy cannot see it through `dataclass_transform`, and every optional field
-reads as required: 177 spurious strict-mode errors.
+The script is the only regeneration command: CI's spec-drift job runs it and
+compares the result byte for byte. The generator **and the formatters it runs**
+are pinned exactly in `requirements-codegen.txt` and installed into their own
+`.venv-codegen`, because an unpinned black reformats the file on a runner and
+fails a pull request that changed nothing. To move to a newer generator, bump
+the pins, regenerate, and commit both together.
+
+Several flags are not cosmetic. Without `--deserialize-default-values enum`, an
+enum-typed field with a default holds the raw string and pydantic emits a
+serialization warning on every request — which under `filterwarnings =
+["error"]` is how the test suite found it. Without `--use-default-kwarg`,
+`Field(None, ...)` passes the default positionally, mypy cannot see it through
+`dataclass_transform`, and every optional field reads as required: 177 spurious
+strict-mode errors. `--openapi-scopes schemas paths` gives the inline request
+and response shapes (entitlement, memory, namespaces, schedules) models of their
+own, and `--disable-timestamp` makes the output a pure function of the input.
 
 The description is vendored at `src/gnarl/openapi.yaml` and ships in the wheel:
 a user debugging a response should be able to read the contract out of the

@@ -149,24 +149,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install 'datamodel-code-generator>=0.82'
+      # Pinned exactly, generator AND formatters: an unpinned black reformats
+      # the file on the runner and fails a pull request that changed nothing.
+      - run: pip install -r requirements-codegen.txt
       - name: Regenerate and diff
         run: |
           set -euo pipefail
-          datamodel-codegen \
-            --input src/gnarl/openapi.yaml --input-file-type openapi \
-            --output src/gnarl/_models.py --output-model-type pydantic_v2.BaseModel \
-            --target-python-version 3.10 --use-standard-collections \
-            --use-union-operator --field-constraints --use-schema-description \
-            --collapse-root-models --deserialize-default-values enum \
-            --use-default-kwarg
-          # The timestamp line changes on every run and means nothing.
-          if ! git diff --exit-code --ignore-matching-lines='^#   timestamp:' \
-               -- src/gnarl/_models.py; then
+          # The same script a developer runs (`make models`), so there is one
+          # regeneration command rather than two that drift apart.
+          CODEGEN=datamodel-codegen scripts/regen-models.sh
+          # Byte for byte: the generator runs with --disable-timestamp, so
+          # there is no line that is allowed to differ.
+          if ! git diff --exit-code -- src/gnarl/_models.py; then
             echo
             echo "src/gnarl/_models.py does not match src/gnarl/openapi.yaml."
-            echo "It is generated — edit the spec and regenerate; see the"
-            echo "command in README.md."
+            echo "It is generated — edit the spec and run scripts/regen-models.sh"
+            echo "(or \`make models\`)."
             exit 1
           fi
 

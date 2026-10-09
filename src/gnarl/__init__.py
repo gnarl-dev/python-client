@@ -67,6 +67,8 @@ from ._models import V1IndexesNameForcemergePostResponse as ForceMergeResult
 from ._models import V1MemoryRecallPostResponse as RecallResult
 from ._models import V1MemoryRememberPostResponse as RememberResult
 from .client import (
+    DEFAULT_BULK_CHUNK,
+    DEFAULT_RETRY,
     DEFAULT_TIMEOUT,
     AsyncClient,
     BulkDoc,
@@ -74,6 +76,7 @@ from .client import (
     Entitlement,
     NodeStatus,
     NodeVersion,
+    Retry,
     SearchResult,
     failed_items,
 )
@@ -107,6 +110,9 @@ __all__ = [
     "NodeStatus",
     "NodeVersion",
     "Entitlement",
+    "Retry",
+    "DEFAULT_RETRY",
+    "DEFAULT_BULK_CHUNK",
     "NamespaceList",
     "Namespaces",
     "AsyncNamespaces",

@@ -89,7 +89,10 @@ except ValidationError as e:
 ```
 
 Each one carries `type`, `reason`, `status`, an optional `detail`, and
-`retry_after` on a 429:
+`retry_after` on a 429 or 503. The client has usually already retried by the
+time you see one — see [Retries](#retries) — so this is what is left when the
+node kept saying "not now", or asked for a longer wait than the client will
+make on its own:
 
 ```python
 import time
@@ -116,6 +119,27 @@ except RateLimited as e:
 An error type this client does not recognise still raises a `GnarlError` with
 `type` set, never something more familiar — a caller branching on a guess takes
 the path meant for a different failure.
+
+
+## Retries
+
+A 429 or 503 means "not now", so the client sends the request again — but only
+a request that is safe to repeat: GET, PUT, DELETE, and the POSTs that change
+nothing (`search`, `iter_search`, `memory.recall`, `memory.answer`,
+`namespaces.search`). A write that may have landed is never resent, because a
+second `index_document` without an id is a second document.
+
+The node's `Retry-After` is honoured exactly. When it asks for longer than the
+cap, the error is raised straight away rather than retried early — asking again
+before the node said to is how a client gets itself limited harder.
+
+```python
+from gnarl import Client, Retry
+
+c = Client("https://localhost:8080", verify=False,
+           retry=Retry(attempts=5, max_delay=60.0))   # the default is 3 and 30s
+c = Client("https://localhost:8080", verify=False, retry=None)   # off
+```
 
 ## Completeness
 
@@ -220,6 +244,42 @@ for item in failed_items(result):
     print("failed:", item.field_id, item.error.reason)
 ```
 
+For more than one request's worth, `bulk_chunked` sends `chunk_size` documents
+at a time from any iterable — a generator over a large file never sits in
+memory whole — and merges the results in order, so `failed_items` still works
+on the whole batch:
+
+```python
+from gnarl import BulkDoc, Client, failed_items
+
+c = Client("https://localhost:8080", verify=False)
+docs = (BulkDoc(f"city-{i}", {"name": f"city {i}"}) for i in range(1_200))
+result = c.bulk_chunked("places", docs, chunk_size=500)
+assert not failed_items(result)
+```
+
+The merged `ack` is the weakest level any chunk reached. A chunk refused as a
+whole raises, with the chunks before it already written — explicit ids make a
+rerun overwrite rather than duplicate.
+
+## Reading a whole result set
+
+`iter_search` pages with `search_after`, which costs the same on page 1,000 as
+on page one; a deep `from_` makes every claim collect `from + size` rows:
+
+```python
+from gnarl import Client, query as q
+
+c = Client("https://localhost:8080", verify=False)
+for hit in c.iter_search("places", q.match_all(), sort=["name"], page_size=200):
+    print(hit.field_id)
+```
+
+`sort` is required — each hit's sort values are the cursor, with `_id` appended
+by the node as the tiebreaker. Iteration ends at an EMPTY page, not a short
+one, because a page can be short when a claim missed its deadline; pass
+`require_complete=True` to make such a page raise instead.
+
 ## Namespaces
 
 Many lightweight tenants over shared pools. A namespace exists from its first
@@ -318,12 +378,17 @@ change its policy; any other answers `Forbidden`.
 A node with RBAC enabled exempts loopback callers, so a local node usually
 needs no token. A remote one always does:
 
+<!-- doctest: skip because it needs a remote node and a token -->
 ```python
-import os
 from gnarl import Client
 
-c = Client("https://node.example.com", token=os.environ["GNARL_TOKEN"])
+c = Client("https://node.example.com", token="...")
+c = Client()      # reads $GNARL_URL, and $GNARL_TOKEN for the token
 ```
+
+With no address, the client reads `GNARL_URL`; with no token, `GNARL_TOKEN`.
+The token is then sent to whatever address the client talks to, so pass
+`token=""` to send none.
 
 See [Connecting](#connecting) for what the node's certificate means for the
 `verify` argument.

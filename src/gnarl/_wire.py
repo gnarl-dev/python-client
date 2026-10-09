@@ -9,6 +9,7 @@ and differ only in whether they await.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
@@ -508,4 +509,160 @@ def _put_policy_call(
     body = _json_body(m.IndexPolicyUpdate.model_validate(fields))
     return _Call(
         "PUT", f"/v1/indexes/{_esc(index)}/_policy", m.IndexPolicy.model_validate, body=body
+    )
+
+
+# ─── Defaults from the environment ──────────────────────────────────────────
+
+#: Read when no address is passed.
+ENV_URL = "GNARL_URL"
+#: Read when no token is passed. ``token=""`` sends none even when it is set.
+ENV_TOKEN = "GNARL_TOKEN"
+
+
+def _resolve_addr(addr: str | None) -> str:
+    if addr is None:
+        addr = os.environ.get(ENV_URL)
+        if not addr:
+            raise ValueError(f"gnarl: no address: pass one, or set ${ENV_URL}")
+    return _normalize_base_url(addr)
+
+
+def _resolve_token(token: str | None) -> str | None:
+    if token is None:
+        return os.environ.get(ENV_TOKEN) or None
+    # An explicit empty string is a decision, not an absence.
+    return token or None
+
+
+# ─── Retry ──────────────────────────────────────────────────────────────────
+
+#: Methods that are safe to send twice by HTTP's own definition.
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
+
+
+@dataclass(frozen=True)
+class Retry:
+    """When to send a refused request again.
+
+    On by default, and narrow on purpose: only a status that means "not now"
+    (429, 503), and only for a request that is safe to repeat — GET, PUT,
+    DELETE, and the POSTs that change nothing (search, recall). A write that
+    may have landed is never resent, because a second ``index_document``
+    without an id is a second document.
+
+    The node's ``Retry-After`` is honoured exactly. When it asks for longer
+    than :attr:`max_delay`, the error is raised at once rather than retried
+    early: asking again before the node said to is how a client gets itself
+    rate-limited harder.
+
+    Pass ``retry=None`` to a client to turn this off.
+    """
+
+    #: Total attempts, including the first. 1 means never retry.
+    attempts: int = 3
+
+    #: The longest single wait, in seconds.
+    max_delay: float = 30.0
+
+    #: The first wait when the node gave no hint; doubled on each retry.
+    backoff: float = 0.5
+
+    #: Statuses worth retrying.
+    statuses: frozenset[int] = frozenset({429, 503})
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("gnarl: Retry.attempts must be at least 1")
+        if self.max_delay < 0 or self.backoff < 0:
+            raise ValueError("gnarl: Retry delays cannot be negative")
+
+    def delay(self, attempt: int, err: GnarlError) -> float | None:
+        """Seconds to wait before attempt ``attempt + 1``, or ``None`` to give up.
+
+        ``attempt`` counts from 1 — the attempt that just failed.
+        """
+        if err.status not in self.statuses or attempt >= self.attempts:
+            return None
+        if err.retry_after is not None:
+            return err.retry_after if err.retry_after <= self.max_delay else None
+        return float(min(self.backoff * 2.0 ** (attempt - 1), self.max_delay))
+
+
+#: What a client uses when ``retry`` is not passed.
+DEFAULT_RETRY = Retry()
+
+
+def _is_idempotent(method: str, declared: bool | None) -> bool:
+    return declared if declared is not None else method.upper() in _IDEMPOTENT_METHODS
+
+
+# ─── Pagination and chunking helpers ────────────────────────────────────────
+
+
+def _cursor_of(page: SearchResult) -> list[Any] | None:
+    """The ``search_after`` cursor for the page after this one, or ``None``
+    when this page was the last.
+
+    The end is an EMPTY page, not a short one: a page can come back short
+    because a claim missed its deadline, and stopping there would end the
+    iteration silently with rows unread.
+    """
+    if not page.hits:
+        return None
+    last = page.hits[-1].sort
+    if not last:
+        raise GnarlError(
+            type="invalid_response",
+            reason=(
+                "a sorted search returned a hit with no `sort` values, so there "
+                "is no cursor for the next page"
+            ),
+        )
+    return list(last)
+
+
+def _check_iter_args(sort: Sequence[Any], page_size: int) -> None:
+    if not sort:
+        # Without an explicit sort there is no cursor: `search_after` pages
+        # by the sort values each hit carries back.
+        raise ValueError("gnarl: iter_search: sort is required")
+    if page_size < 1:
+        raise ValueError("gnarl: iter_search: page_size must be at least 1")
+
+
+def _chunks(docs: Iterable[T], size: int) -> Iterator[list[T]]:
+    if size < 1:
+        raise ValueError("gnarl: chunk_size must be at least 1")
+    chunk: list[T] = []
+    for d in docs:
+        chunk.append(d)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+#: Weakest first. A merged result can only claim what EVERY chunk reached.
+_ACK_ORDER = [m.Ack1.accepted, m.Ack1.accepted_durably, m.Ack1.visible_for_search]
+
+
+def _merge_bulk(results: Sequence[m.BulkIndexResponse]) -> m.BulkIndexResponse:
+    """Several chunks' results as one, in request order.
+
+    ``errors`` is true if any chunk had one, so :func:`failed_items` works on
+    the merged result exactly as on a single one. ``ack`` is the WEAKEST level
+    any chunk reached — reporting the strongest would claim visibility for
+    documents that only reached the log.
+    """
+    if not results:
+        raise ValueError("gnarl: bulk: no documents")
+    ack = min((r.ack for r in results), key=_ACK_ORDER.index)
+    timed_out = any(r.timed_out for r in results)
+    return m.BulkIndexResponse(
+        items=[item for r in results for item in r.items],
+        errors=any(r.errors for r in results),
+        ack=ack,
+        timed_out=True if timed_out else None,
     )

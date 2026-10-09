@@ -14,8 +14,10 @@ There is an :class:`AsyncClient` with the same surface.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from typing import Any, TypeVar
 from urllib.parse import quote
 
@@ -23,16 +25,21 @@ import httpx
 
 from . import _models as m
 from ._wire import (
+    DEFAULT_RETRY,
     BulkDoc,
     Entitlement,
     NodeStatus,
     NodeVersion,
+    Retry,
     SearchResult,
     _activate_call,
     _bulk_body,
     _Call,
     _check_complete,
+    _check_iter_args,
+    _chunks,
     _create_index_body,
+    _cursor_of,
     _decode,
     _document_body,
     _entitlement_call,
@@ -40,9 +47,12 @@ from ._wire import (
     _forcemerge_call,
     _get_policy_call,
     _headers,
-    _normalize_base_url,
+    _is_idempotent,
+    _merge_bulk,
     _put_policy_call,
     _raise_for_status,
+    _resolve_addr,
+    _resolve_token,
     _search_body,
     _to_search_result,
     failed_items,
@@ -60,7 +70,10 @@ __all__ = [
     "NodeStatus",
     "NodeVersion",
     "Entitlement",
+    "Retry",
+    "DEFAULT_RETRY",
     "DEFAULT_TIMEOUT",
+    "DEFAULT_BULK_CHUNK",
     "failed_items",
 ]
 
@@ -69,7 +82,14 @@ T = TypeVar("T")
 #: Applied when no ``timeout`` is given.
 DEFAULT_TIMEOUT = 30.0
 
+#: Documents per request in :meth:`Client.bulk_chunked` when not given.
+DEFAULT_BULK_CHUNK = 500
+
 _USER_AGENT = "gnarl-python"
+
+# Indirected so a test can observe the waits without spending them.
+_sleep = time.sleep
+_asleep = asyncio.sleep
 
 
 # ─── Sync client ────────────────────────────────────────────────────────────
@@ -78,11 +98,17 @@ _USER_AGENT = "gnarl-python"
 class Client:
     """Talks to one Gnarl node. Safe for concurrent use across threads.
 
-    :param addr: the node's address. A missing scheme means https.
+    :param addr: the node's address. A missing scheme means https. When not
+        given, ``$GNARL_URL``.
     :param token: an RBAC capability token, sent as a bearer token. A node with
         RBAC enabled exempts loopback callers, so a local node usually needs no
-        token; a remote one always does.
+        token; a remote one always does. When not given, ``$GNARL_TOKEN`` —
+        which is then sent to whatever address this client talks to, so pass
+        ``token=""`` to send none.
     :param timeout: seconds, applied to each request.
+    :param retry: when to resend a request the node refused with 429 or 503.
+        On by default for requests that are safe to repeat, honouring
+        ``Retry-After``; see :class:`Retry`. ``None`` turns it off.
     :param verify: TLS verification. A node generates a self-signed certificate
         on first run, so ``verify=False`` is the switch you reach for against a
         development node. It disables the protection TLS exists to provide —
@@ -95,16 +121,18 @@ class Client:
 
     def __init__(
         self,
-        addr: str,
+        addr: str | None = None,
         *,
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         verify: bool | str = True,
+        retry: Retry | None = DEFAULT_RETRY,
         user_agent: str = _USER_AGENT,
         http_client: httpx.Client | None = None,
     ) -> None:
-        self._base = _normalize_base_url(addr)
-        self._token = token
+        self._base = _resolve_addr(addr)
+        self._token = _resolve_token(token)
+        self._retry = retry
         self._user_agent = user_agent
         self._owns_http = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout, verify=verify)
@@ -132,25 +160,45 @@ class Client:
     # -- transport --
 
     def _do(
-        self, method: str, path: str, body: Any = None, *, want_json: bool = True
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        want_json: bool = True,
+        idempotent: bool | None = None,
     ) -> Any:
         content = None if body is None else json.dumps(body).encode()
-        try:
-            resp = self._http.request(
-                method,
-                self._base + path,
-                content=content,
-                headers=_headers(self._token, self._user_agent, content is not None),
-            )
-        except httpx.HTTPError as exc:
-            raise GnarlError(
-                type="transport_error", reason=f"{method} {path}: {exc}"
-            ) from exc
-        _raise_for_status(resp)
-        return _decode(resp) if want_json else None
+        retry = self._retry if _is_idempotent(method, idempotent) else None
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = self._http.request(
+                    method,
+                    self._base + path,
+                    content=content,
+                    headers=_headers(self._token, self._user_agent, content is not None),
+                )
+            except httpx.HTTPError as exc:
+                raise GnarlError(
+                    type="transport_error", reason=f"{method} {path}: {exc}"
+                ) from exc
+            try:
+                _raise_for_status(resp)
+            except GnarlError as err:
+                wait = retry.delay(attempt, err) if retry else None
+                if wait is None:
+                    raise
+                _sleep(wait)
+                continue
+            return _decode(resp) if want_json else None
 
     def _call(self, call: _Call[T]) -> T:
-        raw = self._do(call.method, call.path, call.body, want_json=call.want_json)
+        raw = self._do(
+            call.method, call.path, call.body,
+            want_json=call.want_json, idempotent=call.idempotent,
+        )
         return call.parse(raw)
 
     # -- indexes --
@@ -310,11 +358,73 @@ class Client:
             query, size, from_, sort, search_after, source,
             track_total_hits, profile, verify, deadline_ms,
         )
-        raw = self._do("POST", f"/v1/indexes/{_esc(index)}/_search", body)
+        # A POST that changes nothing, so it is retried like a GET.
+        raw = self._do(
+            "POST", f"/v1/indexes/{_esc(index)}/_search", body, idempotent=True
+        )
         result = _to_search_result(raw)
         if require_complete:
             _check_complete(result)
         return result
+
+    def bulk_chunked(
+        self,
+        index: str,
+        docs: Iterable[Mapping[str, Any] | BulkDoc],
+        *,
+        chunk_size: int = DEFAULT_BULK_CHUNK,
+    ) -> m.BulkIndexResponse:
+        """Index any number of documents, ``chunk_size`` per request.
+
+        ``docs`` is consumed lazily, so a generator over a large file never
+        sits in memory whole. The per-chunk results are merged into one, in
+        request order: :func:`failed_items` works on it as on a single bulk,
+        and ``ack`` is the WEAKEST level any chunk reached.
+
+        A chunk that fails as a whole — a 400 for the request, a refused
+        connection — raises, and the chunks before it have been written.
+        Supplying ids with :class:`BulkDoc` makes a rerun overwrite rather than
+        duplicate them.
+        """
+        results = [self.bulk(index, chunk) for chunk in _chunks(docs, chunk_size)]
+        return _merge_bulk(results)
+
+    def iter_search(
+        self,
+        index: str,
+        query: m.Query | None = None,
+        *,
+        sort: Sequence[Any],
+        page_size: int = 500,
+        source: bool | list[str] | None = None,
+        require_complete: bool = False,
+        verify: bool = False,
+        deadline_ms: int | None = None,
+    ) -> Iterator[m.Hit]:
+        """Every hit, in ``sort`` order, a page at a time via ``search_after``.
+
+        The way to read a whole result set: deep ``from_`` offsets make every
+        claim collect ``from + size`` rows, while a cursor costs the same on
+        page 1,000 as on page one. ``sort`` is required — the cursor IS each
+        hit's sort values — and the node appends ``_id`` as the tiebreaker, so
+        no row is skipped or repeated between pages.
+
+        Iteration ends at an empty page, not a short one: a page can come back
+        short because a claim missed its deadline. Pass ``require_complete`` to
+        turn such a page into :class:`~gnarl.errors.IncompleteResult` instead.
+        """
+        _check_iter_args(sort, page_size)
+        cursor: list[Any] | None = None
+        while True:
+            page = self.search(
+                index, query, size=page_size, sort=sort, search_after=cursor,
+                source=source, require_complete=require_complete, verify=verify,
+                deadline_ms=deadline_ms,
+            )
+            yield from page.hits
+            cursor = _cursor_of(page)
+            if cursor is None:
+                return
 
     # -- node --
 
@@ -402,16 +512,18 @@ class AsyncClient:
 
     def __init__(
         self,
-        addr: str,
+        addr: str | None = None,
         *,
         token: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         verify: bool | str = True,
+        retry: Retry | None = DEFAULT_RETRY,
         user_agent: str = _USER_AGENT,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self._base = _normalize_base_url(addr)
-        self._token = token
+        self._base = _resolve_addr(addr)
+        self._token = _resolve_token(token)
+        self._retry = retry
         self._user_agent = user_agent
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout, verify=verify)
@@ -432,25 +544,45 @@ class AsyncClient:
         await self.aclose()
 
     async def _do(
-        self, method: str, path: str, body: Any = None, *, want_json: bool = True
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        want_json: bool = True,
+        idempotent: bool | None = None,
     ) -> Any:
         content = None if body is None else json.dumps(body).encode()
-        try:
-            resp = await self._http.request(
-                method,
-                self._base + path,
-                content=content,
-                headers=_headers(self._token, self._user_agent, content is not None),
-            )
-        except httpx.HTTPError as exc:
-            raise GnarlError(
-                type="transport_error", reason=f"{method} {path}: {exc}"
-            ) from exc
-        _raise_for_status(resp)
-        return _decode(resp) if want_json else None
+        retry = self._retry if _is_idempotent(method, idempotent) else None
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = await self._http.request(
+                    method,
+                    self._base + path,
+                    content=content,
+                    headers=_headers(self._token, self._user_agent, content is not None),
+                )
+            except httpx.HTTPError as exc:
+                raise GnarlError(
+                    type="transport_error", reason=f"{method} {path}: {exc}"
+                ) from exc
+            try:
+                _raise_for_status(resp)
+            except GnarlError as err:
+                wait = retry.delay(attempt, err) if retry else None
+                if wait is None:
+                    raise
+                await _asleep(wait)
+                continue
+            return _decode(resp) if want_json else None
 
     async def _call(self, call: _Call[T]) -> T:
-        raw = await self._do(call.method, call.path, call.body, want_json=call.want_json)
+        raw = await self._do(
+            call.method, call.path, call.body,
+            want_json=call.want_json, idempotent=call.idempotent,
+        )
         return call.parse(raw)
 
     async def create_index(self, name: str, schema: m.IndexSchema) -> None:
@@ -540,11 +672,49 @@ class AsyncClient:
             query, size, from_, sort, search_after, source,
             track_total_hits, profile, verify, deadline_ms,
         )
-        raw = await self._do("POST", f"/v1/indexes/{_esc(index)}/_search", body)
+        raw = await self._do(
+            "POST", f"/v1/indexes/{_esc(index)}/_search", body, idempotent=True
+        )
         result = _to_search_result(raw)
         if require_complete:
             _check_complete(result)
         return result
+
+    async def bulk_chunked(
+        self,
+        index: str,
+        docs: Iterable[Mapping[str, Any] | BulkDoc],
+        *,
+        chunk_size: int = DEFAULT_BULK_CHUNK,
+    ) -> m.BulkIndexResponse:
+        results = [await self.bulk(index, chunk) for chunk in _chunks(docs, chunk_size)]
+        return _merge_bulk(results)
+
+    async def iter_search(
+        self,
+        index: str,
+        query: m.Query | None = None,
+        *,
+        sort: Sequence[Any],
+        page_size: int = 500,
+        source: bool | list[str] | None = None,
+        require_complete: bool = False,
+        verify: bool = False,
+        deadline_ms: int | None = None,
+    ) -> AsyncIterator[m.Hit]:
+        _check_iter_args(sort, page_size)
+        cursor: list[Any] | None = None
+        while True:
+            page = await self.search(
+                index, query, size=page_size, sort=sort, search_after=cursor,
+                source=source, require_complete=require_complete, verify=verify,
+                deadline_ms=deadline_ms,
+            )
+            for hit in page.hits:
+                yield hit
+            cursor = _cursor_of(page)
+            if cursor is None:
+                return
 
     async def version(self) -> NodeVersion:
         body = await self._do("GET", "/v1/node/version")

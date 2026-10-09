@@ -13,7 +13,7 @@ node applies and the caller cannot override.
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -25,9 +25,13 @@ from ._wire import (
     _bulk_body,
     _Call,
     _check_complete,
+    _check_iter_args,
+    _chunks,
+    _cursor_of,
     _document_body,
     _esc,
     _json_body,
+    _merge_bulk,
     _query_string,
     _search_body,
     _to_search_result,
@@ -264,6 +268,47 @@ class Namespaces:
         )
         return self._c._call(_search(ns, body, require_complete))
 
+    def bulk_chunked(
+        self,
+        ns: str,
+        docs: Iterable[Mapping[str, Any] | BulkDoc],
+        *,
+        chunk_size: int = 500,
+        wait_for: WaitFor | None = None,
+        wait_for_timeout_ms: int | None = None,
+    ) -> m.BulkIndexResponse:
+        """A tenant import of any size, ``chunk_size`` per request, merged.
+        See :meth:`Client.bulk_chunked`."""
+        results = [
+            self.bulk(ns, chunk, wait_for=wait_for, wait_for_timeout_ms=wait_for_timeout_ms)
+            for chunk in _chunks(docs, chunk_size)
+        ]
+        return _merge_bulk(results)
+
+    def iter_search(
+        self,
+        ns: str,
+        query: m.Query | None = None,
+        *,
+        sort: Sequence[Any],
+        page_size: int = 500,
+        source: bool | list[str] | None = None,
+        require_complete: bool = False,
+    ) -> Iterator[m.Hit]:
+        """Every hit in the namespace, via ``search_after``. See
+        :meth:`Client.iter_search`."""
+        _check_iter_args(sort, page_size)
+        cursor: list[Any] | None = None
+        while True:
+            page = self.search(
+                ns, query, size=page_size, sort=sort, search_after=cursor,
+                source=source, require_complete=require_complete,
+            )
+            yield from page.hits
+            cursor = _cursor_of(page)
+            if cursor is None:
+                return
+
     def get_document(self, ns: str, id: str) -> dict[str, Any]:
         """A document's stored fields. Raises :class:`~gnarl.NotFound`."""
         return self._c._call(_get_document(ns, id))
@@ -386,6 +431,46 @@ class AsyncNamespaces:
             track_total_hits, profile, verify, deadline_ms,
         )
         return await self._c._call(_search(ns, body, require_complete))
+
+    async def bulk_chunked(
+        self,
+        ns: str,
+        docs: Iterable[Mapping[str, Any] | BulkDoc],
+        *,
+        chunk_size: int = 500,
+        wait_for: WaitFor | None = None,
+        wait_for_timeout_ms: int | None = None,
+    ) -> m.BulkIndexResponse:
+        results = [
+            await self.bulk(
+                ns, chunk, wait_for=wait_for, wait_for_timeout_ms=wait_for_timeout_ms
+            )
+            for chunk in _chunks(docs, chunk_size)
+        ]
+        return _merge_bulk(results)
+
+    async def iter_search(
+        self,
+        ns: str,
+        query: m.Query | None = None,
+        *,
+        sort: Sequence[Any],
+        page_size: int = 500,
+        source: bool | list[str] | None = None,
+        require_complete: bool = False,
+    ) -> AsyncIterator[m.Hit]:
+        _check_iter_args(sort, page_size)
+        cursor: list[Any] | None = None
+        while True:
+            page = await self.search(
+                ns, query, size=page_size, sort=sort, search_after=cursor,
+                source=source, require_complete=require_complete,
+            )
+            for hit in page.hits:
+                yield hit
+            cursor = _cursor_of(page)
+            if cursor is None:
+                return
 
     async def get_document(self, ns: str, id: str) -> dict[str, Any]:
         return await self._c._call(_get_document(ns, id))

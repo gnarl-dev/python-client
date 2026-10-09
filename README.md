@@ -433,7 +433,7 @@ Four layers:
 |---|---|---|
 | unit | `tests/test_query.py`, `tests/test_errors.py` | builders emit the exact wire shape; every error body parses |
 | regression | `tests/test_regressions.py` | defects that shipped once stay fixed |
-| integration | `tests/test_client.py` | the full request/response path over a mocked transport |
+| integration | `tests/test_client.py`, `tests/test_api_surface.py`, `tests/test_ergonomics.py` | the full request/response path over a mocked transport, through both the sync and the async client |
 | smoke + conformance | `tests/conformance/` | a real node boots and answers real HTTP |
 
 Compiling — or in Python, importing — proves the types match the description.
@@ -445,6 +445,18 @@ pytest                                            # everything but conformance
 LUCENIA_BIN=/path/to/lucenia pytest               # starts a node, runs it all
 GNARL_TEST_NODE=https://localhost:8080 pytest     # uses a node you have
 ```
+
+CI runs conformance against the latest public release from
+[gnarl-dev/releases](https://github.com/gnarl-dev/releases) — the binary a user
+installs, checked against the release's `SHA256SUMS.txt` — on every pull
+request and nightly, with no secret. Any release's `gnarl` binary works locally
+the same way: `LUCENIA_BIN=/path/to/gnarl pytest`.
+
+The vendored description is checked against the server's by a
+`repository_dispatch` (`openapi-updated`) the server repository sends when its
+description changes, carrying the SHA-256 of `rust/api/openapi.yaml`. The
+server repository is private, so this workflow cannot fetch it; the hash is a
+byte-for-byte comparison without the bytes.
 
 The README's examples are executed by `tests/test_readme_examples.py` against a
 live node, so a snippet here that does not work is a failing test rather than a

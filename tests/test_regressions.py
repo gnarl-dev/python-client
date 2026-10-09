@@ -294,3 +294,23 @@ def test_the_generated_models_carry_no_timestamp():
     Generated with `--disable-timestamp`, nothing is allowed to differ."""
     header = (ROOT / "src/gnarl/_models.py").read_text().splitlines()[:5]
     assert not any("timestamp" in line for line in header), header
+
+
+def test_conformance_needs_no_private_token():
+    """Conformance and spec-freshness were gated on a LUCENIA_RELEASE_TOKEN
+    secret that was never set, so the layer that talks to a real node had
+    never run in CI. The node now comes from the public release repository."""
+    ci = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "LUCENIA_RELEASE_TOKEN" not in ci
+    assert "--repo gnarl-dev/releases" in ci
+    assert "repos/lucenia/lucenia" not in ci, "the server repository is private"
+
+
+def test_ci_runs_nightly_and_on_a_spec_dispatch():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    # YAML 1.1 reads a bare `on:` key as the boolean True.
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["schedule"], "no nightly run"
+    assert "openapi-updated" in triggers["repository_dispatch"]["types"]
+    freshness = workflow["jobs"]["spec-freshness"]
+    assert "repository_dispatch" in freshness["if"]

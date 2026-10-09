@@ -9,3 +9,5 @@ build/
 *.egg-info/
 conformance.xml
 .venv-codegen/
+# The released node CI downloads for conformance.
+node/

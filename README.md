@@ -6,8 +6,12 @@ A node is a peer, not a coordinator, so there is no cluster endpoint to point
 at. You talk to a node and it answers for the mesh. Any node will do.
 
 ```bash
-pip install gnarl
+pip install gnarl-client
 ```
+
+The package is **`gnarl-client`** and the import is **`gnarl`**. The bare
+name `gnarl` on PyPI belongs to an unrelated project — installing it gets you
+somebody else's code.
 
 ## Quick start
 

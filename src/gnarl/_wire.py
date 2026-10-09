@@ -675,3 +675,17 @@ def _merge_bulk(results: Sequence[m.BulkIndexResponse]) -> m.BulkIndexResponse:
         ack=ack,
         timed_out=True if timed_out else None,
     )
+
+
+_ModelT = TypeVar("_ModelT")
+
+
+def _public_engine(model: _ModelT) -> _ModelT:
+    """Name the native engine ``native`` whichever node answered.
+
+    Nodes released before the rename report it by its old internal binding,
+    ``tantivy``. It is the same engine; translating here means a caller never
+    sees two names for it."""
+    if getattr(model, "engine_binding", None) == "tantivy":
+        model.engine_binding = "native"  # type: ignore[attr-defined]
+    return model

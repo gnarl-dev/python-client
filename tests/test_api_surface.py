@@ -482,6 +482,47 @@ def test_remember_sends_only_what_was_given(call):
     assert (res.id, res.embedder) == ("m1", "minilm")
 
 
+@respx.mock
+def test_the_engine_is_called_native_whichever_node_answers(call):
+    # A node released before the rename reports the native engine as
+    # `tantivy`. Each response that carries the engine must say `native`.
+    respx.post(f"{BASE}/v1/memory/remember").mock(
+        return_value=ok(
+            {
+                "id": "m1",
+                "namespace": "agent",
+                "user": "u",
+                "embedder": "minilm",
+                "engine_binding": "tantivy",
+            }
+        )
+    )
+    assert call(lambda c: c.memory.remember("x")).engine_binding == "native"
+
+    respx.get(f"{BASE}/v1/indexes").mock(
+        return_value=ok(
+            {
+                "indexes": [
+                    {
+                        "name": "a",
+                        "schema": {"fields": {}},
+                        "claim_count": 4,
+                        "engine_binding": "tantivy",
+                    },
+                    {
+                        "name": "b",
+                        "schema": {"fields": {}},
+                        "claim_count": 4,
+                        "engine_binding": "lucene",
+                    },
+                ]
+            }
+        )
+    )
+    page, _ = call(lambda c: c.list_indexes_page())
+    assert [i.engine_binding for i in page] == ["native", "lucene"]
+
+
 def test_remember_refuses_empty_content(call):
     with pytest.raises(ValueError):
         call(lambda c: c.memory.remember("  "))

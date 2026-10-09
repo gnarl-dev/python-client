@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from . import _models as m
-from ._wire import _as_dict, _Call, _json_body
+from ._wire import _as_dict, _Call, _json_body, _public_engine
 
 if TYPE_CHECKING:
     from .client import AsyncClient, Client
@@ -44,7 +44,10 @@ def _remember(content: str, fields: dict[str, Any]) -> _Call[m.V1MemoryRememberP
         m.V1MemoryRememberPostRequest.model_validate({"content": content, **fields})
     )
     return _Call(
-        "POST", "/v1/memory/remember", m.V1MemoryRememberPostResponse.model_validate, body=body
+        "POST",
+        "/v1/memory/remember",
+        lambda raw: _public_engine(m.V1MemoryRememberPostResponse.model_validate(raw)),
+        body=body,
     )
 
 

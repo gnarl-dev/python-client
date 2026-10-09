@@ -49,6 +49,7 @@ from ._wire import (
     _headers,
     _is_idempotent,
     _merge_bulk,
+    _public_engine,
     _put_policy_call,
     _raise_for_status,
     _resolve_addr,
@@ -256,7 +257,7 @@ class Client:
         if after:
             path += "?after=" + quote(after, safe="")
         raw = m.IndexListResponse.model_validate(self._do("GET", path))
-        return raw.indexes, raw.next_after
+        return [_public_engine(i) for i in raw.indexes], raw.next_after
 
     def get_schema(self, name: str) -> m.IndexSchema:
         """The index's current mapping."""
@@ -617,7 +618,7 @@ class AsyncClient:
         if after:
             path += "?after=" + quote(after, safe="")
         raw = m.IndexListResponse.model_validate(await self._do("GET", path))
-        return raw.indexes, raw.next_after
+        return [_public_engine(i) for i in raw.indexes], raw.next_after
 
     async def get_schema(self, name: str) -> m.IndexSchema:
         body = await self._do("GET", f"/v1/indexes/{_esc(name)}/_schema")

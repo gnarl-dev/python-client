@@ -600,7 +600,7 @@ def _is_idempotent(method: str, declared: bool | None) -> bool:
 # ─── Pagination and chunking helpers ────────────────────────────────────────
 
 
-def _cursor_of(page: SearchResult) -> list[Any] | None:
+def _cursor_of(page: SearchResult, previous: list[Any] | None) -> list[Any] | None:
     """The ``search_after`` cursor for the page after this one, or ``None``
     when this page was the last.
 
@@ -619,7 +619,16 @@ def _cursor_of(page: SearchResult) -> list[Any] | None:
                 "is no cursor for the next page"
             ),
         )
-    return list(last)
+    cursor = list(last)
+    if cursor == previous:
+        # The same cursor twice would request the same page forever. A node
+        # that ignored `search_after` would do exactly that, and an iterator
+        # that never ends is worse than one that fails.
+        raise GnarlError(
+            type="invalid_response",
+            reason=f"search_after made no progress: the cursor stayed at {cursor!r}",
+        )
+    return cursor
 
 
 def _check_iter_args(sort: Sequence[Any], page_size: int) -> None:

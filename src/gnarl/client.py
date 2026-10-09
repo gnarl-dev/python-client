@@ -422,7 +422,7 @@ class Client:
                 deadline_ms=deadline_ms,
             )
             yield from page.hits
-            cursor = _cursor_of(page)
+            cursor = _cursor_of(page, cursor)
             if cursor is None:
                 return
 
@@ -712,7 +712,7 @@ class AsyncClient:
             )
             for hit in page.hits:
                 yield hit
-            cursor = _cursor_of(page)
+            cursor = _cursor_of(page, cursor)
             if cursor is None:
                 return
 

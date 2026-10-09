@@ -250,11 +250,14 @@ memory whole — and merges the results in order, so `failed_items` still works
 on the whole batch:
 
 ```python
-from gnarl import BulkDoc, Client, failed_items
+from gnarl import BulkDoc, Client, failed_items, query as q
 
 c = Client("https://localhost:8080", verify=False)
-docs = (BulkDoc(f"city-{i}", {"name": f"city {i}"}) for i in range(1_200))
-result = c.bulk_chunked("places", docs, chunk_size=500)
+if not c.index_exists("readings"):
+    c.create_index("readings", q.schema({"seq": q.long_field()}))
+
+docs = (BulkDoc(f"r{i:05}", {"seq": i}) for i in range(1_200))
+result = c.bulk_chunked("readings", docs, chunk_size=500)
 assert not failed_items(result)
 ```
 
@@ -271,12 +274,13 @@ on page one; a deep `from_` makes every claim collect `from + size` rows:
 from gnarl import Client, query as q
 
 c = Client("https://localhost:8080", verify=False)
-for hit in c.iter_search("places", q.match_all(), sort=["name"], page_size=200):
-    print(hit.field_id)
+seqs = [h.field_source["seq"] for h in c.iter_search("readings", sort=["seq"], page_size=200)]
+print(len(seqs), "readings, in order")
 ```
 
 `sort` is required — each hit's sort values are the cursor, with `_id` appended
-by the node as the tiebreaker. Iteration ends at an EMPTY page, not a short
+by the node as the tiebreaker — and must name a sortable field: a number, a
+date or a boolean. Keyword and text fields are refused as sort keys. Iteration ends at an EMPTY page, not a short
 one, because a page can be short when a claim missed its deadline; pass
 `require_complete=True` to make such a page raise instead.
 
@@ -434,7 +438,7 @@ Four layers:
 | unit | `tests/test_query.py`, `tests/test_errors.py` | builders emit the exact wire shape; every error body parses |
 | regression | `tests/test_regressions.py` | defects that shipped once stay fixed |
 | integration | `tests/test_client.py`, `tests/test_api_surface.py`, `tests/test_ergonomics.py` | the full request/response path over a mocked transport, through both the sync and the async client |
-| smoke + conformance | `tests/conformance/` | a real node boots and answers real HTTP |
+| smoke + conformance | `tests/conformance/` | a real node boots and answers real HTTP; `test_ga_surface.py` drives entitlement, namespaces, memory, snapshots, forcemerge and the iterators |
 
 Compiling — or in Python, importing — proves the types match the description.
 It does not prove the description matches the server, and that gap is where

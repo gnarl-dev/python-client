@@ -366,6 +366,14 @@ def test_a_hit_with_no_cursor_is_an_error_not_an_end():
 
 
 @respx.mock
+def test_a_cursor_that_does_not_move_is_an_error_not_a_loop():
+    """A node that ignored `search_after` would return the first page forever."""
+    respx.post(f"{BASE}/v1/indexes/places/_search").mock(return_value=page("d1", "d2"))
+    with Client(BASE) as c, pytest.raises(GnarlError, match="no progress"):
+        list(c.iter_search("places", sort=["n"], page_size=2))
+
+
+@respx.mock
 def test_namespace_iter_search(call):
     route = respx.post(f"{BASE}/v1/namespaces/t/_search").mock(
         side_effect=[page("d1", "d2"), page()]

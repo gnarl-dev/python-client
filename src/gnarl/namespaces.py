@@ -305,7 +305,7 @@ class Namespaces:
                 source=source, require_complete=require_complete,
             )
             yield from page.hits
-            cursor = _cursor_of(page)
+            cursor = _cursor_of(page, cursor)
             if cursor is None:
                 return
 
@@ -468,7 +468,7 @@ class AsyncNamespaces:
             )
             for hit in page.hits:
                 yield hit
-            cursor = _cursor_of(page)
+            cursor = _cursor_of(page, cursor)
             if cursor is None:
                 return
 

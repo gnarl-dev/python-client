@@ -102,7 +102,7 @@ jobs:
           suite = ET.parse("conformance.xml").getroot().find("testsuite")
           ran = int(suite.get("tests")) - int(suite.get("skipped"))
           print(f"{ran} conformance tests executed")
-          if ran < 45:
+          if ran < 80:
               sys.exit(
                   f"only {ran} conformance tests executed — the harness found "
                   "no node and skipped, which passes without proving anything"

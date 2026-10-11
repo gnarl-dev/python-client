@@ -18,7 +18,7 @@ somebody else's code.
 ```python
 from gnarl import Client, query as q
 
-with Client("https://localhost:8080", verify=False) as c:
+with Client() as c:          # finds the Gnarly app on this machine
     c.create_index("places", q.schema({
         "name":     q.keyword_field(),
         "location": q.geo_point_field(),
@@ -41,7 +41,7 @@ import asyncio
 from gnarl import AsyncClient, query as q
 
 async def main():
-    async with AsyncClient("https://localhost:8080", verify=False) as c:
+    async with AsyncClient() as c:
         res = await c.search("places", q.match_all())
         print(len(res))
 
@@ -50,16 +50,45 @@ asyncio.run(main())
 
 ## Connecting
 
-**A node serves TLS by default.** `lucenia start` listens on **8080** over
-**https**, using a self-signed certificate it generates on first run. `--no-tls`
-turns that off, and the desktop build uses it, but a node you started with the
-plain command speaks https — which is why every example above says so.
+### `Client()` finds the Gnarly app on this machine
 
-That certificate cannot be verified, because nothing signed it. `verify=False`
-is the right answer for a node **you started yourself** and the wrong answer
-for anything else: it turns off the protection TLS exists to provide, and a
-client that keeps it on by habit will happily talk to whoever answers the
-address. Against a node with a real certificate, pass nothing:
+With no address, the client looks for a node in this order:
+
+1. the address you pass: `Client("https://search.example.com")`;
+2. `$GNARL_URL`;
+3. the endpoint the node on this machine recorded when it started, in
+   `$LUCENIA_DATA_DIR/runtime/endpoint.json`, then
+   `~/.lucenia/runtime/endpoint.json` — the same data directories the `gnarl`
+   command line looks in;
+4. `http://127.0.0.1:43300`, where the Gnarly desktop app listens.
+
+So with the Gnarly app running, `Client()` needs nothing else. The recorded
+endpoint is a hint, not an authority: a plain-`http` one is used only when it
+points at loopback, so a stray file can never send your requests — or your
+token — across a network in the clear. An address you configure yourself is
+used exactly as given; an `https` one is never downgraded.
+
+### TLS
+
+The Gnarly app serves plain HTTP on loopback only. **A node you start with
+`gnarl start` serves TLS** on the same port, 43300, using a self-signed
+certificate it generates on first run (`--no-tls` turns that off). `Client()`
+finds that node too, through the endpoint it records — but verification of a
+certificate nothing signed fails, by design, until you say otherwise.
+
+`verify=False` is the right answer for a node **you started yourself** and the
+wrong answer for anything else: it turns off the protection TLS exists to
+provide, and a client that keeps it on by habit will happily talk to whoever
+answers the address:
+
+<!-- doctest: skip because it needs a node started with `gnarl start` on 43300 -->
+```python
+from gnarl import Client
+
+c = Client("https://localhost:43300", verify=False)   # your own `gnarl start` node
+```
+
+Against a node with a real certificate, pass nothing:
 
 <!-- doctest: skip because it needs a deployment with a real certificate -->
 ```python
@@ -79,7 +108,7 @@ Every failure is a `GnarlError`. Catch the subclass you care about:
 ```python
 from gnarl import Client, AlreadyExists, ValidationError, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 try:
     c.create_index("places", q.schema({"name": q.keyword_field()}))
 except AlreadyExists:
@@ -98,7 +127,7 @@ make on its own:
 import time
 from gnarl import Client, RateLimited, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 try:
     c.search("places", q.match_all())
 except RateLimited as e:
@@ -136,9 +165,8 @@ before the node said to is how a client gets itself limited harder.
 ```python
 from gnarl import Client, Retry
 
-c = Client("https://localhost:8080", verify=False,
-           retry=Retry(attempts=5, max_delay=60.0))   # the default is 3 and 30s
-c = Client("https://localhost:8080", verify=False, retry=None)   # off
+c = Client(retry=Retry(attempts=5, max_delay=60.0))   # the default is 3 and 30s
+c = Client(retry=None)                                 # off
 ```
 
 ## Completeness
@@ -151,7 +179,7 @@ answer is a wrong answer:
 ```python
 from gnarl import Client, IncompleteResult, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 try:
     res = c.search("places", q.match_all(), require_complete=True)
     print(f"complete: {len(res)} hits from {res.coverage.served_claims} claims")
@@ -172,7 +200,7 @@ the node holds independently of whoever served it:
 ```python
 from gnarl import Client, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 res = c.search("places", q.match_all(), verify=True)
 if not res.partial:
     print("every row returned was proven")
@@ -195,7 +223,7 @@ came to:
 ```python
 from gnarl import Client, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 res = c.search("places", q.match_all(), profile=True)
 fan_out = res.profile.fan_out
 print(f"{fan_out.nodes_responded}/{fan_out.nodes_contacted} nodes answered")
@@ -235,7 +263,7 @@ common way to lose writes silently. `failed_items` makes the check a one-liner:
 ```python
 from gnarl import Client, failed_items
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 result = c.bulk("places", [
     {"name": "sydney"},
     {"name": "melbourne"},
@@ -252,7 +280,7 @@ on the whole batch:
 ```python
 from gnarl import BulkDoc, Client, failed_items, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 if not c.index_exists("readings"):
     c.create_index("readings", q.schema({"seq": q.long_field()}))
 
@@ -273,7 +301,7 @@ on page one; a deep `from_` makes every claim collect `from + size` rows:
 ```python
 from gnarl import Client, query as q
 
-c = Client("https://localhost:8080", verify=False)
+c = Client()
 seqs = [h.field_source["seq"] for h in c.iter_search("readings", sort=["seq"], page_size=200)]
 print(len(seqs), "readings, in order")
 ```
@@ -293,7 +321,7 @@ caller cannot override:
 ```python
 from gnarl import Client, query as q
 
-with Client("https://localhost:8080", verify=False) as c:
+with Client() as c:
     c.namespaces.index_document(
         "tenant-a", {"subject": "invoice overdue"}, id="t1", wait_for="visible"
     )
@@ -317,7 +345,7 @@ unreachable peer means a namespace may be missing.
 ```python
 from gnarl import Client
 
-with Client("https://localhost:8080", verify=False) as c:
+with Client() as c:
     c.memory.remember("the boat is moored at pier 4", namespace="deckhand")
     found = c.memory.recall("where is the boat", namespace="deckhand", k=3)
     for mem in found.memories:
@@ -335,7 +363,7 @@ is deliberately no default.
 ```python
 from gnarl import Client
 
-with Client("https://localhost:8080", verify=False) as c:
+with Client() as c:
     ent = c.entitlement()
     print(ent.state)            # active, refused, unenforced or none
     if ent.expires_at:
@@ -354,7 +382,7 @@ refusal raises `ValidationError` whose `reason` says which failure it was.
 ```python
 from gnarl import Client
 
-with Client("https://localhost:8080", verify=False) as c:
+with Client() as c:
     c.snapshots.register_repository("local", {"type": "fs", "location": "/var/backups/gnarl"})
     job = c.snapshots.create("local", "places-1", index="places")
     done = c.snapshots.wait(job)              # raises JobFailed if it failed
@@ -387,12 +415,12 @@ needs no token. A remote one always does:
 from gnarl import Client
 
 c = Client("https://node.example.com", token="...")
-c = Client()      # reads $GNARL_URL, and $GNARL_TOKEN for the token
+c = Client()      # finds the node (see Connecting); $GNARL_TOKEN for the token
 ```
 
-With no address, the client reads `GNARL_URL`; with no token, `GNARL_TOKEN`.
-The token is then sent to whatever address the client talks to, so pass
-`token=""` to send none.
+With no token, the client reads `GNARL_TOKEN`. The token is then sent to
+whatever address the client talks to, so pass `token=""` to send none. See
+[Connecting](#connecting) for how the address is found when none is given.
 
 See [Connecting](#connecting) for what the node's certificate means for the
 `verify` argument.
@@ -447,7 +475,7 @@ client bugs live. So the conformance suite starts a real node and drives it:
 ```bash
 pytest                                            # everything but conformance
 LUCENIA_BIN=/path/to/lucenia pytest               # starts a node, runs it all
-GNARL_TEST_NODE=https://localhost:8080 pytest     # uses a node you have
+GNARL_TEST_NODE=http://127.0.0.1:43300 pytest     # uses a node you have
 ```
 
 CI runs conformance against the latest public release from

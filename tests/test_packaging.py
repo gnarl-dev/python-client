@@ -9,6 +9,9 @@ to somebody else's code under the name they expected to be ours.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
+import zipfile
 from importlib import metadata
 from pathlib import Path
 
@@ -54,3 +57,29 @@ def test_no_document_tells_a_reader_to_install_the_wrong_package():
             if re.search(r"pip install\s+(-U\s+)?['\"]?gnarl(?![-\w])", line):
                 offenders.append(f"{path.name}:{n}: {line.strip()}")
     assert not offenders, "installs the unrelated PyPI project:\n" + "\n".join(offenders)
+
+
+def _build_wheel(tmp_path: Path) -> Path:
+    out = tmp_path / "dist"
+    subprocess.run(
+        [sys.executable, "-m", "hatchling", "build", "-t", "wheel", "-d", str(out)],
+        cwd=ROOT, check=True, capture_output=True,
+    )
+    (wheel,) = out.glob("gnarl_client-*.whl")
+    return wheel
+
+
+def test_the_wheel_ships_py_typed(tmp_path):
+    """gnarl-client 0.2.0 declared ``Typing :: Typed`` and shipped no
+    ``py.typed``, so mypy and pyright treated the whole package as untyped —
+    every model and method an ``Any`` — in exactly the projects that asked for
+    types. PEP 561 makes the marker file the switch, not the classifier.
+
+    Built, not just checked on disk: the file has to survive the wheel's
+    include rules, which is where it would be lost.
+    """
+    with zipfile.ZipFile(_build_wheel(tmp_path)) as whl:
+        names = set(whl.namelist())
+    assert "gnarl/py.typed" in names
+    # And what claims the types still ships beside it.
+    assert {"gnarl/__init__.py", "gnarl/_models.py", "gnarl/openapi.yaml"} <= names

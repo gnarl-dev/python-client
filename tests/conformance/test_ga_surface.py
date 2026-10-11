@@ -19,7 +19,6 @@ from gnarl import (
     Client,
     GnarlError,
     IncompleteResult,
-    InternalError,
     NotFound,
     ValidationError,
     failed_items,
@@ -246,19 +245,6 @@ def test_forcemerge_merges_and_reports(client: Client, index):
     assert out.partial is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=InternalError,
-    reason=(
-        "SERVER DEFECT: _forcemerge answers 500 'no engine for local claim N' "
-        "when any locally-held claim of the index has not been written yet. "
-        "Engines are created on a claim's first write, and force_merge_index "
-        "treats a claim with no engine as an error rather than as nothing to "
-        "merge — so a new index, or a small one whose documents did not reach "
-        "every claim, cannot be merged at all. Strict, so this goes red the "
-        "day it is fixed."
-    ),
-)
 def test_forcemerge_on_an_index_with_an_unwritten_claim(client: Client, index):
     name = index(q.schema({"n": q.integer_field()}))
     out = client.forcemerge(name)

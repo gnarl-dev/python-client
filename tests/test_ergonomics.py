@@ -265,12 +265,130 @@ def test_the_address_and_token_come_from_the_environment(monkeypatch):
     assert route.calls.last.request.headers["Authorization"] == "Bearer from-env"
 
 
-def test_no_address_anywhere_says_how_to_give_one(monkeypatch):
+# ─── Finding the node on this machine ──────────────────────────────────────
+
+
+@pytest.fixture
+def machine(monkeypatch, tmp_path):
+    """A machine with no configuration: no $GNARL_URL, an empty home, and a
+    data directory nobody has pointed at. Returns a writer for endpoint.json.
+
+    HOME is replaced so that a developer's own ~/.lucenia — a real Gnarly app
+    running beside the test — can never decide the outcome.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("GNARL_URL", raising=False)
-    with pytest.raises(ValueError, match="GNARL_URL"):
-        Client()
-    with pytest.raises(ValueError, match="GNARL_URL"):
-        AsyncClient()
+    monkeypatch.delenv("LUCENIA_DATA_DIR", raising=False)
+
+    def write(where: str, body) -> None:
+        root = home / ".lucenia" if where == "home" else tmp_path / where
+        if where != "home":
+            monkeypatch.setenv("LUCENIA_DATA_DIR", str(root))
+        (root / "runtime").mkdir(parents=True, exist_ok=True)
+        text = body if isinstance(body, str) else json.dumps(body)
+        (root / "runtime" / "endpoint.json").write_text(text)
+
+    return write
+
+
+def ep(scheme: str = "http", host: str = "127.0.0.1", port: int = 50123) -> dict:
+    return {"scheme": scheme, "host": host, "port": port, "pid": 4242}
+
+
+def test_with_nothing_configured_the_client_finds_the_gnarly_app(machine):
+    """The Gnarly app's Console: plain HTTP, loopback, 43300 — never 8080."""
+    assert Client()._base == "http://127.0.0.1:43300"
+    c = AsyncClient()
+    assert c._base == "http://127.0.0.1:43300"
+    asyncio.run(c.aclose())
+
+
+def test_the_endpoint_the_node_recorded_is_used(machine):
+    machine("data", ep(port=50123))
+    assert Client()._base == "http://127.0.0.1:50123"
+    c = AsyncClient()
+    assert c._base == "http://127.0.0.1:50123"
+    asyncio.run(c.aclose())
+
+
+def test_the_home_data_dir_is_read_when_no_data_dir_is_set(machine):
+    machine("home", ep(port=50124))
+    assert Client()._base == "http://127.0.0.1:50124"
+
+
+def test_lucenia_data_dir_comes_before_home(machine):
+    machine("home", ep(port=50124))
+    machine("data", ep(port=50125))
+    assert Client()._base == "http://127.0.0.1:50125"
+
+
+def test_gnarl_url_comes_before_the_recorded_endpoint(machine, monkeypatch):
+    machine("data", ep(port=50125))
+    monkeypatch.setenv("GNARL_URL", "https://elsewhere.test")
+    assert Client()._base == "https://elsewhere.test"
+
+
+def test_an_explicit_address_comes_before_everything(machine, monkeypatch):
+    machine("data", ep(port=50125))
+    monkeypatch.setenv("GNARL_URL", "https://elsewhere.test")
+    assert Client("https://mine.test")._base == "https://mine.test"
+
+
+def test_a_configured_https_address_is_never_downgraded(machine, monkeypatch):
+    """Discovery is for when nothing was configured: an https address the
+    caller gave keeps https even with an http endpoint recorded locally."""
+    machine("data", ep(port=50125))
+    monkeypatch.setenv("GNARL_URL", "https://127.0.0.1:50125")
+    assert Client()._base == "https://127.0.0.1:50125"
+    monkeypatch.setenv("GNARL_URL", "127.0.0.1:50125")  # no scheme means https
+    assert Client()._base == "https://127.0.0.1:50125"
+
+
+def test_a_recorded_tls_endpoint_keeps_tls(machine):
+    machine("data", ep("https", "127.0.0.1", 43300))
+    assert Client()._base == "https://127.0.0.1:43300"
+
+
+@pytest.mark.parametrize("host", ["10.0.0.7", "node.example.com", "0.0.0.0"])
+def test_a_plain_http_endpoint_off_loopback_is_ignored(machine, host):
+    """A hint must never send requests, and a token, in the clear across a
+    network. It falls through to the next place to look."""
+    machine("home", ep(port=50124))
+    machine("data", ep("http", host, 50125))
+    assert Client()._base == "http://127.0.0.1:50124"
+
+
+def test_a_tls_endpoint_off_loopback_is_used(machine):
+    machine("data", ep("https", "10.0.0.7", 50125))
+    assert Client()._base == "https://10.0.0.7:50125"
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.2", "::1"])
+def test_every_loopback_spelling_counts(machine, host):
+    machine("data", ep("http", host, 50125))
+    want = "[::1]" if host == "::1" else host
+    assert Client()._base == f"http://{want}:50125"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "{not json",
+        "[]",
+        json.dumps({"scheme": "ftp", "host": "127.0.0.1", "port": 1}),
+        json.dumps({"scheme": "http", "host": "", "port": 50125}),
+        json.dumps({"scheme": "http", "host": "127.0.0.1", "port": 0}),
+        json.dumps({"scheme": "http", "host": "127.0.0.1", "port": 70000}),
+        json.dumps({"scheme": "http", "host": "127.0.0.1", "port": "50125"}),
+        json.dumps({"scheme": "http", "host": "127.0.0.1", "port": True}),
+        json.dumps({"scheme": "http", "host": "127.0.0.1"}),
+    ],
+)
+def test_a_damaged_endpoint_file_falls_through(machine, body):
+    machine("data", body)
+    assert Client()._base == "http://127.0.0.1:43300"
 
 
 def test_an_explicit_address_wins(monkeypatch):

@@ -7,7 +7,7 @@ build-backend = "hatchling.build"
 # `gnarl` is an unrelated project, so `pip install gnarl` installs somebody
 # else's code under the name a reader expects to be ours.
 name = "gnarl-client"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python client for Gnarl, a decentralized search fabric"
 readme = "README.md"
 requires-python = ">=3.10"

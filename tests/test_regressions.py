@@ -316,6 +316,25 @@ def test_ci_runs_nightly_and_on_a_spec_dispatch():
     assert "repository_dispatch" in freshness["if"]
 
 
+@respx.mock
+def test_recall_in_a_namespace_nobody_has_written_to_parses():
+    """gnarl-client 0.2.0 raised ``pydantic.ValidationError`` here.
+
+    A node answers a recall over a namespace with no memories yet as
+    ``{"namespace", "count": 0, "memories": []}`` — no ``embedder`` — and the
+    generated model required it. That is the first call an agent makes on a
+    fresh install ("what do I remember?"), so the first thing a new user saw
+    was a traceback. The node now always sends ``embedder``; the client takes
+    either.
+    """
+    respx.post(f"{BASE}/v1/memory/recall").mock(
+        return_value=ok({"namespace": "never-written", "count": 0, "memories": []})
+    )
+    with Client(BASE) as c:
+        res = c.memory.recall("what do I remember?", namespace="never-written")
+    assert (res.count, res.memories, res.embedder) == (0, [], None)
+
+
 def test_no_document_or_default_names_port_8080():
     """Every client README and default said ``https://localhost:8080``.
 

@@ -27,7 +27,20 @@ from ._wire import _as_dict, _Call, _json_body, _public_engine
 if TYPE_CHECKING:
     from .client import AsyncClient, Client
 
-__all__ = ["Memory", "AsyncMemory"]
+__all__ = ["Memory", "AsyncMemory", "RecallResult"]
+
+
+class RecallResult(m.V1MemoryRecallPostResponse):
+    """What ``memory.recall`` returns.
+
+    The generated model, with one field relaxed: ``embedder`` is ``None`` when
+    the node does not say. Released nodes answer a recall over a namespace
+    nobody has written to yet with no ``embedder`` at all, and
+    requiring it turned the most ordinary first call an agent makes — "what do
+    I remember?" on a fresh install — into a ``pydantic.ValidationError``.
+    """
+
+    embedder: str | None = None  # type: ignore[assignment]
 
 
 # ─── Calls, shared by both groups ───────────────────────────────────────────
@@ -51,7 +64,7 @@ def _remember(content: str, fields: dict[str, Any]) -> _Call[m.V1MemoryRememberP
     )
 
 
-def _recall(query: str, fields: dict[str, Any]) -> _Call[m.V1MemoryRecallPostResponse]:
+def _recall(query: str, fields: dict[str, Any]) -> _Call[RecallResult]:
     if not query or not query.strip():
         raise ValueError("gnarl: memory.recall: empty query")
     body = _json_body(m.V1MemoryRecallPostRequest.model_validate({"query": query, **fields}))
@@ -59,7 +72,7 @@ def _recall(query: str, fields: dict[str, Any]) -> _Call[m.V1MemoryRecallPostRes
     return _Call(
         "POST",
         "/v1/memory/recall",
-        m.V1MemoryRecallPostResponse.model_validate,
+        RecallResult.model_validate,
         body=body,
         idempotent=True,
     )
@@ -178,7 +191,7 @@ class Memory:
         user: str | None = None,
         session: str | None = None,
         k: int | None = None,
-    ) -> m.V1MemoryRecallPostResponse:
+    ) -> RecallResult:
         """The memories that best match ``query``, best first.
 
         ``k`` above 100 is CLAMPED to 100 by the node, not refused — so getting
@@ -308,7 +321,7 @@ class AsyncMemory:
         user: str | None = None,
         session: str | None = None,
         k: int | None = None,
-    ) -> m.V1MemoryRecallPostResponse:
+    ) -> RecallResult:
         fields = _drop_none(namespace=namespace, space=space, user=user, session=session, k=k)
         return await self._c._call(_recall(query, fields))
 

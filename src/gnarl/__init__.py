@@ -64,7 +64,6 @@ from ._models import (
     Verification,
 )
 from ._models import V1IndexesNameForcemergePostResponse as ForceMergeResult
-from ._models import V1MemoryRecallPostResponse as RecallResult
 from ._models import V1MemoryRememberPostResponse as RememberResult
 from .client import (
     DEFAULT_BULK_CHUNK,
@@ -95,7 +94,7 @@ from .errors import (
     Unsupported,
     ValidationError,
 )
-from .memory import AsyncMemory, Memory
+from .memory import AsyncMemory, Memory, RecallResult
 from .namespaces import AsyncNamespaces, NamespaceList, Namespaces
 from .snapshots import AsyncSnapshots, Snapshots
 

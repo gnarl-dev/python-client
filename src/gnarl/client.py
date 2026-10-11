@@ -6,7 +6,7 @@ for the mesh. Any node will do.
 
     from gnarl import Client, query as q
 
-    with Client("http://localhost:8080") as c:
+    with Client() as c:   # the Gnarly app on this machine
         res = c.search("places", q.geo_distance("location", -33.8688, 151.2093, 1_000))
 
 There is an :class:`AsyncClient` with the same surface.
@@ -100,7 +100,10 @@ class Client:
     """Talks to one Gnarl node. Safe for concurrent use across threads.
 
     :param addr: the node's address. A missing scheme means https. When not
-        given, ``$GNARL_URL``.
+        given: ``$GNARL_URL``, then the node on this machine — the address it
+        recorded in ``$LUCENIA_DATA_DIR/runtime/endpoint.json`` or
+        ``~/.lucenia/runtime/endpoint.json`` — then ``http://127.0.0.1:43300``,
+        where the Gnarly app listens.
     :param token: an RBAC capability token, sent as a bearer token. A node with
         RBAC enabled exempts loopback callers, so a local node usually needs no
         token; a remote one always does. When not given, ``$GNARL_TOKEN`` —

@@ -8,12 +8,14 @@ and differ only in whether they await.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Generic, TypeVar
 from urllib.parse import quote, urlencode
 
@@ -520,11 +522,88 @@ ENV_URL = "GNARL_URL"
 ENV_TOKEN = "GNARL_TOKEN"
 
 
+#: Where the Gnarly app (or any node) keeps its data when not told otherwise.
+#: Read to find ``runtime/endpoint.json``.
+ENV_DATA_DIR = "LUCENIA_DATA_DIR"
+
+#: The node's own port when nothing says otherwise: the Gnarly desktop app's
+#: Console listener, plain HTTP on loopback.
+DEFAULT_LOCAL_URL = "http://127.0.0.1:43300"
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _endpoint_files() -> list[Path]:
+    """The ``endpoint.json`` files to try, in order.
+
+    The same lookup the ``gnarl`` CLI uses for a data directory —
+    ``$LUCENIA_DATA_DIR``, then ``~/.lucenia`` — minus ``--data-dir``, which a
+    library has no equivalent of: pass the address instead.
+    """
+    files = []
+    data_dir = os.environ.get(ENV_DATA_DIR)
+    if data_dir:
+        files.append(Path(data_dir) / "runtime" / "endpoint.json")
+    try:
+        files.append(Path.home() / ".lucenia" / "runtime" / "endpoint.json")
+    except RuntimeError:
+        pass  # no home directory to look in
+    return files
+
+
+def _read_endpoint(path: Path) -> str | None:
+    """The base URL a node recorded in ``path``, or None if it is not usable.
+
+    The node writes ``{"scheme", "host", "port", "pid"}`` when it starts. The
+    file is a hint, not an authority: a node that crashed never removes it, and
+    anyone who can write the directory can write it. So it is used only when it
+    is well formed, and plain HTTP only on loopback — a hint must never be able
+    to send requests, and the token with them, in the clear across a network.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    scheme, host, port = raw.get("scheme"), raw.get("host"), raw.get("port")
+    if scheme not in ("http", "https") or not isinstance(host, str) or not host:
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        return None
+    if scheme == "http" and not _is_loopback(host):
+        return None
+    if ":" in host:  # an IPv6 literal
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def _discover_local() -> str:
+    for path in _endpoint_files():
+        url = _read_endpoint(path)
+        if url:
+            return url
+    return DEFAULT_LOCAL_URL
+
+
 def _resolve_addr(addr: str | None) -> str:
+    """The node to talk to.
+
+    In order: ``addr``; ``$GNARL_URL``; the endpoint the node on this machine
+    recorded in ``$LUCENIA_DATA_DIR/runtime/endpoint.json`` or
+    ``~/.lucenia/runtime/endpoint.json``; and finally the Gnarly app's default,
+    ``http://127.0.0.1:43300``. A configured address is used as given — an
+    ``https`` one is never downgraded, and one without a scheme means https.
+    """
     if addr is None:
-        addr = os.environ.get(ENV_URL)
-        if not addr:
-            raise ValueError(f"gnarl: no address: pass one, or set ${ENV_URL}")
+        addr = os.environ.get(ENV_URL) or _discover_local()
     return _normalize_base_url(addr)
 
 

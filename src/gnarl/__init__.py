@@ -6,7 +6,7 @@ for the mesh. Any node will do.
 
     from gnarl import Client, query as q
 
-    with Client("http://localhost:8080") as c:
+    with Client() as c:   # finds the Gnarly app on this machine
         c.create_index("places", q.schema({
             "name":     q.text_field(),
             "location": q.geo_point_field(),

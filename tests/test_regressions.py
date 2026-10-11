@@ -314,3 +314,22 @@ def test_ci_runs_nightly_and_on_a_spec_dispatch():
     assert "openapi-updated" in triggers["repository_dispatch"]["types"]
     freshness = workflow["jobs"]["spec-freshness"]
     assert "repository_dispatch" in freshness["if"]
+
+
+def test_no_document_or_default_names_port_8080():
+    """Every client README and default said ``https://localhost:8080``.
+
+    A node has never defaulted to 8080 — `gnarl start` and the Gnarly app both
+    listen on 43300 — so a reader who copied the quick start connected to
+    nothing, or to whatever else on their machine held 8080.
+    """
+    root = __import__("pathlib").Path(__file__).resolve().parent.parent
+    paths = [root / "README.md", *root.glob("docs/**/*.md"), *root.glob("src/gnarl/*.py")]
+    offenders = [
+        f"{p.relative_to(root)}:{n}: {line.strip()}"
+        for p in paths
+        if p.name != "_models.py"
+        for n, line in enumerate(p.read_text().splitlines(), 1)
+        if "8080" in line
+    ]
+    assert not offenders, "names port 8080:\n" + "\n".join(offenders)

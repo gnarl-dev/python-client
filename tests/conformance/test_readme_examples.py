@@ -19,6 +19,7 @@ import re
 import textwrap
 from pathlib import Path
 
+import httpx
 import pytest
 
 import gnarl
@@ -26,10 +27,12 @@ from gnarl import query as q
 
 README = Path(__file__).resolve().parents[2] / "README.md"
 
-#: The placeholder address every runnable example uses. It is rewritten to the
-#: live node's address before the block is executed, so the README can show a
-#: realistic URL and the test can still run.
-PLACEHOLDER = "https://localhost:8080"
+#: A client the README constructs with no address: ``Client()`` finds the node
+#: on the reader's machine, which here is the live test node instead. The
+#: address (and, for the harness's self-signed node, ``verify``) is injected
+#: before the block runs. A client given an address of its own is left alone —
+#: such a block is about somewhere else and is marked skip.
+DISCOVERED = re.compile(r"\b((?:Async)?Client)\((?=\)|\s*[a-z_]+\s*=)")
 
 FENCE = re.compile(
     r"(?:(?P<directive><!--\s*doctest:\s*(?P<action>\w+)(?P<rest>[^>]*?)-->)\s*\n)?"
@@ -51,7 +54,7 @@ class Block:
     @property
     def runnable(self) -> bool:
         # A block that never constructs a client has nothing to drive.
-        return PLACEHOLDER in self.code and self.skip is None
+        return DISCOVERED.search(self.code) is not None and self.skip is None
 
 
 def _blocks() -> list[Block]:
@@ -100,7 +103,7 @@ RUNNABLE = [b for b in BLOCKS if b.runnable]
 @pytest.mark.conformance
 @pytest.mark.parametrize("block", RUNNABLE, ids=[b.id for b in RUNNABLE])
 def test_every_runnable_example_runs(block: Block, node: str, client):
-    """Executed against a live node, with the placeholder address rewritten.
+    """Executed against a live node, each ``Client()`` pointed at it.
 
     The examples are a NARRATIVE — the quick start creates `places` and
     everything after it uses what that left behind — so they are run in README
@@ -109,7 +112,8 @@ def test_every_runnable_example_runs(block: Block, node: str, client):
     anyway, which is the failure mode a doc test exists to prevent.
     """
     _prepare(client, first=block is RUNNABLE[0])
-    source = block.code.replace(PLACEHOLDER, node)
+    verify = httpx.URL(node).host not in ("127.0.0.1", "::1", "localhost")
+    source = DISCOVERED.sub(lambda m: f"{m.group(1)}({node!r}, verify={verify}, ", block.code)
     scope: dict = {"gnarl": gnarl, "q": q}
     try:
         exec(compile(textwrap.dedent(source), block.id, "exec"), scope)  # noqa: S102
